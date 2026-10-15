@@ -2,8 +2,8 @@
 #include <winver.h>
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,1,0,0
-PRODUCTVERSION 1,1,0,0
+FILEVERSION 1,2,0,0
+PRODUCTVERSION 1,2,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -12,9 +12,9 @@ BEGIN
     BLOCK "041104B0"
     BEGIN
       VALUE "FileDescription", "CEditor - custom-drawn text editor"
-      VALUE "FileVersion", "1.1.0.0"
+      VALUE "FileVersion", "1.2.0.0"
       VALUE "ProductName", "CEditor"
-      VALUE "ProductVersion", "1.1.0.0"
+      VALUE "ProductVersion", "1.2.0.0"
     END
   END
   BLOCK "VarFileInfo"

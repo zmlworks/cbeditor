@@ -1,5 +1,5 @@
 /*
- * CEditor 1.1 - custom-drawn Win32 text editor with EDIT-compatible inline Japanese IME,
+ * CEditor 1.2 - custom-drawn Win32 text editor with EDIT-compatible inline Japanese IME,
  * custom title bar, find/replace (own regex engine), word wrap, large files, Markdown view.
  * Plain C / Win32 / GDI / IMM32 / DWM. No EDIT/RichEdit for the document itself.
  */
@@ -27,10 +27,11 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <psapi.h>
 #include "regex.h"
 
 #define APPNAME   L"CEditor"
-#define APPVER    L"1.1.0"
+#define APPVER    L"1.2.0"
 #define CLS_FRAME L"CEditorFrame"
 #define CLS_TEXT  L"CEditorText"
 #define CLS_FIND  L"CEditorFind"
@@ -91,46 +92,140 @@ static void *xmalloc(size_t n) { return xrealloc(NULL, n); }
 #define IS_LO(c) ((c) >= 0xDC00 && (c) <= 0xDFFF)
 
 /* ================================================================== */
-/* gap buffer (UTF-16) + incremental line index                        */
+/* text storage: piece table (UTF-16) + incremental line index         */
 /* ================================================================== */
-static WCHAR *g_buf;
-static size_t g_cap, g_gs, g_ge;            /* gap = [g_gs, g_ge) */
+/* The loaded text (g_org) is never modified. Inserted text is appended to add blocks (append-only,
+   never moved), and the document is the concatenation of the pieces in g_pc. Deleting only edits the
+   piece list. Typing extends the last piece in place, so it does not create new pieces. */
+typedef struct { const WCHAR *p; size_t pos, len; } Piece;   /* pos = document offset of the piece */
+static WCHAR *g_org;                        /* original text (immutable) */
+static WCHAR **g_blk; static size_t g_nblk; /* all add blocks (freed on compaction) */
+static WCHAR *g_add; static size_t g_addN, g_addCap;   /* current add block */
+static Piece *g_pc; static size_t g_npc, g_pccap, g_pcHint;
+static size_t g_len;
+#define PIECES_COMPACT 50000                /* piece count that triggers consolidation */
 static size_t *g_ls; static size_t g_nl, g_lscap;
 /* lazy shift: entries with index >= g_dIdx must be adjusted by g_delta (typing = O(1)) */
 static size_t g_dIdx = (size_t)-1; static ptrdiff_t g_delta;
 static unsigned g_docVer = 1;
 
-static size_t DocLen(void) { return g_cap - (g_ge - g_gs); }
-static WCHAR DocAt(size_t i) { return i < g_gs ? g_buf[i] : g_buf[i + (g_ge - g_gs)]; }
+static size_t DocLen(void) { return g_len; }
+static size_t PieceAt(size_t i) {           /* piece containing offset i (< g_len); sequential access is O(1) */
+    size_t k = g_pcHint;
+    if (k < g_npc && i - g_pc[k].pos < g_pc[k].len) return k;
+    if (++k < g_npc && i - g_pc[k].pos < g_pc[k].len) return g_pcHint = k;
+    size_t lo = 0, hi = g_npc - 1;
+    while (lo < hi) { size_t m = (lo + hi + 1) / 2; if (g_pc[m].pos <= i) lo = m; else hi = m - 1; }
+    return g_pcHint = lo;
+}
+static WCHAR DocAt(size_t i) { if (i >= g_len) return 0; const Piece *c = &g_pc[PieceAt(i)]; return c->p[i - c->pos]; }
 static void DocGet(size_t p, size_t n, WCHAR *d) {
-    if (p < g_gs) {
-        size_t a = g_gs - p; if (a > n) a = n;
-        memcpy(d, g_buf + p, a * sizeof(WCHAR)); d += a; p += a; n -= a;
-    }
-    if (n) memcpy(d, g_buf + p + (g_ge - g_gs), n * sizeof(WCHAR));
-}
-static void GapMove(size_t p) {
-    if (p < g_gs) {
-        size_t n = g_gs - p;
-        memmove(g_buf + g_ge - n, g_buf + p, n * sizeof(WCHAR));
-        g_gs -= n; g_ge -= n;
-    } else if (p > g_gs) {
-        size_t n = p - g_gs;
-        memmove(g_buf + g_gs, g_buf + g_ge, n * sizeof(WCHAR));
-        g_gs += n; g_ge += n;
+    for (size_t k = n ? PieceAt(p) : 0; n; k++) {
+        size_t o = p - g_pc[k].pos, a = g_pc[k].len - o; if (a > n) a = n;
+        memcpy(d, g_pc[k].p + o, a * sizeof(WCHAR)); d += a; p += a; n -= a;
     }
 }
-static void GapReserve(size_t n) {
-    if (g_ge - g_gs >= n) return;
-    size_t len = DocLen();
-    size_t ncap = len + n + len / 8 + 4096;
-    WCHAR *nb = xmalloc(ncap * sizeof(WCHAR));
-    size_t tail = g_cap - g_ge;
-    if (g_gs) memcpy(nb, g_buf, g_gs * sizeof(WCHAR));
-    if (tail) memcpy(nb + ncap - tail, g_buf + g_ge, tail * sizeof(WCHAR));
-    free(g_buf);
-    g_buf = nb; g_ge = ncap - tail; g_cap = ncap;
+static void PcInsert(size_t k, Piece pc) {
+    if (g_npc == g_pccap) { g_pccap = g_pccap * 2 + 16; g_pc = xrealloc(g_pc, g_pccap * sizeof(Piece)); }
+    memmove(g_pc + k + 1, g_pc + k, (g_npc - k) * sizeof(Piece));
+    g_pc[k] = pc; g_npc++;
 }
+static void PcShift(size_t k, ptrdiff_t d) { for (; k < g_npc; k++) g_pc[k].pos += (size_t)d; }
+static size_t SplitAt(size_t p) {           /* makes p a piece boundary; returns the index of the piece starting at p */
+    if (p >= g_len) return g_npc;
+    size_t k = PieceAt(p); Piece *c = &g_pc[k];
+    if (c->pos == p) return k;
+    Piece r = { c->p + (p - c->pos), p, c->len - (p - c->pos) };
+    c->len = p - c->pos;
+    PcInsert(k + 1, r);
+    return k + 1;
+}
+static const WCHAR *AddText(const WCHAR *s, size_t n) {
+    if (g_addCap - g_addN < n) {
+        g_addCap = n > (1u << 20) ? n : (1u << 20); g_addN = 0;
+        g_add = xmalloc(g_addCap * sizeof(WCHAR));
+        g_blk = xrealloc(g_blk, (g_nblk + 1) * sizeof *g_blk); g_blk[g_nblk++] = g_add;
+    }
+    WCHAR *d = g_add + g_addN; memcpy(d, s, n * sizeof(WCHAR)); g_addN += n;
+    return d;
+}
+static void PtInsert(size_t p, const WCHAR *s, size_t n) {
+    const WCHAR *t = AddText(s, n);
+    size_t k = SplitAt(p);
+    if (k > 0 && t > g_add && g_pc[k - 1].p + g_pc[k - 1].len == t) g_pc[k - 1].len += n;   /* typing */
+    else { Piece pc = { t, p, n }; PcInsert(k++, pc); }
+    PcShift(k, (ptrdiff_t)n); g_len += n;
+}
+static void PtDelete(size_t p, size_t n) {
+    size_t a = SplitAt(p), b = SplitAt(p + n);
+    memmove(g_pc + a, g_pc + b, (g_npc - b) * sizeof(Piece)); g_npc -= b - a;
+    PcShift(a, -(ptrdiff_t)n); g_len -= n;
+}
+/* t (n units, malloc'ed) becomes the whole document as one piece; old buffers are freed */
+static void PtAdopt(WCHAR *t, size_t n) {
+    if (g_org != t) free(g_org);
+    for (size_t i = 0; i < g_nblk; i++) free(g_blk[i]);
+    free(g_blk); g_blk = NULL; g_nblk = 0; g_add = NULL; g_addN = g_addCap = 0;
+    g_org = t; g_len = n; g_npc = 0; g_pcHint = 0;
+    if (n) { Piece pc = { t, 0, n }; PcInsert(0, pc); }
+}
+/* consolidate all pieces into one buffer (on save, or when there are very many pieces) */
+static void Compact(void) {
+    if (g_npc <= 1 && !g_nblk) return;
+    WCHAR *t = xmalloc((g_len + 1) * sizeof(WCHAR));
+    DocGet(0, g_len, t);
+    PtAdopt(t, g_len);
+}
+
+/* ---- per-line metadata (kept parallel to the line index) ---- */
+#define CK 128                              /* checkpoint spacing (units) */
+typedef struct { int i, x; } Mark;
+typedef struct {                            /* measurement progress of one display line */
+    unsigned id;                            /* changes whenever the content below is invalidated */
+    int mi, mx;                             /* measured prefix [0, mi) (cluster boundary), x at mi */
+    Mark *ck; int nck, cck;                 /* checkpoints (i, x): ck[0] = {0, 0}, then about every CK units */
+    int *rows; int nr, cr, rw;              /* wrap row starts found so far (rows[0] = 0) for wrap width rw */
+    BOOL rdone;                             /* all rows found */
+} LineInfo;
+typedef struct { LineInfo *li; int rows; } LineMeta;   /* rows: wrapped row count, 0 = not known yet */
+static LineMeta *g_lm;
+static unsigned g_infoSeq; static size_t g_ninfo;
+static long long g_rowsSum;                 /* wrap: sum over lines of (rows known ? rows : 1) */
+static int g_rowsW = -1;                    /* wrap width the known row counts belong to */
+static size_t g_bgL;                        /* idle row counting: lines below this are known */
+static size_t g_tcL; static long long g_tcS; /* cache: rows above line g_tcL */
+
+static void InfoReset(LineInfo *li) {
+    li->id = ++g_infoSeq; li->mi = li->mx = 0; li->nr = 0; li->rw = -1; li->rdone = FALSE;
+    if (!li->cck) { li->cck = 16; li->ck = xmalloc(16 * sizeof(Mark)); }
+    li->ck[0].i = li->ck[0].x = 0; li->nck = 1;
+}
+static void InfoFree(size_t L) {
+    LineInfo *li = g_lm[L].li;
+    if (li) { free(li->ck); free(li->rows); free(li); g_lm[L].li = NULL; g_ninfo--; }
+}
+static int RowsK(size_t L) { return g_lm[L].rows ? g_lm[L].rows : 1; }
+static void SetRowCount(size_t L, int n) {
+    int d = (n ? n : 1) - RowsK(L);
+    g_rowsSum += d; if (L < g_tcL) g_tcS += d;
+    g_lm[L].rows = n;
+    if (!n && g_bgL > L) g_bgL = L;
+}
+/* text of line L changed from offset off on: keep what was measured safely before it */
+static void LineEdited(size_t L, size_t off) {
+    SetRowCount(L, 0);
+    LineInfo *li = g_lm[L].li;
+    if (!li) return;
+    int keep = off > 64 ? (int)off - 64 : 0;  /* clusters and break rules look a little around a position */
+    li->id = ++g_infoSeq;
+    while (li->nck > 1 && li->ck[li->nck - 1].i > keep) li->nck--;
+    li->mi = li->ck[li->nck - 1].i; li->mx = li->ck[li->nck - 1].x;
+    /* rows[m] is still valid if rows[m + 1] <= keep (the scan that found rows[m] ended before rows[m + 1]) */
+    int j = 0; while (j + 1 < li->nr && li->rows[j + 1] <= keep) j++;
+    if (li->nr) li->nr = j > 1 ? j : 1;
+    li->rdone = FALSE;
+}
+
 static size_t LS(size_t j) { return j >= g_dIdx ? (size_t)((ptrdiff_t)g_ls[j] + g_delta) : g_ls[j]; }
 static void FlushDelta(void) {
     if (g_dIdx != (size_t)-1) {
@@ -148,23 +243,25 @@ static void LsReserve(size_t n) {
     if (n <= g_lscap) return;
     g_lscap = n + n / 2 + 64;
     g_ls = xrealloc(g_ls, g_lscap * sizeof(size_t));
+    g_lm = xrealloc(g_lm, g_lscap * sizeof(LineMeta));
 }
 static void RebuildLines(void) {  /* full scan; used only on load */
+    for (size_t L = 0; L < g_nl; L++) InfoFree(L);
     g_dIdx = (size_t)-1; g_delta = 0;
     g_nl = 0; LsReserve(64);
     g_ls[g_nl++] = 0;
-    for (int seg = 0; seg < 2; seg++) {
-        const WCHAR *b = seg ? g_buf + g_ge : g_buf;
-        size_t n = seg ? g_cap - g_ge : g_gs, base = seg ? g_gs : 0;
-        const WCHAR *p = b, *e = b + n;
+    for (size_t k = 0; k < g_npc; k++) {
+        const WCHAR *b = g_pc[k].p, *p = b, *e = b + g_pc[k].len;
         while (p < e) {
             const WCHAR *q = wmemchr(p, L'\n', (size_t)(e - p));
             if (!q) break;
             if (g_nl == g_lscap) LsReserve(g_lscap * 2);
-            g_ls[g_nl++] = base + (size_t)(q - b) + 1;
+            g_ls[g_nl++] = g_pc[k].pos + (size_t)(q - b) + 1;
             p = q + 1;
         }
     }
+    memset(g_lm, 0, g_nl * sizeof(LineMeta));
+    g_rowsSum = (long long)g_nl; g_bgL = 0; g_tcL = 0; g_tcS = 0;
 }
 static size_t LineOf(size_t pos) {
     size_t lo = 0, hi = g_nl - 1;
@@ -178,32 +275,41 @@ static void RawInsert(size_t p, const WCHAR *s, size_t n) {
     if (!n) return;
     size_t L = LineOf(p), k = 0;
     for (size_t i = 0; i < n; i++) if (s[i] == L'\n') k++;
-    GapMove(p); GapReserve(n);
-    memcpy(g_buf + g_gs, s, n * sizeof(WCHAR)); g_gs += n;
+    LineEdited(L, p - LineStart(L));
+    PtInsert(p, s, n);
     if (k == 0) ShiftFrom(L + 1, (ptrdiff_t)n);
     else {
         FlushDelta();
         LsReserve(g_nl + k);
         memmove(g_ls + L + 1 + k, g_ls + L + 1, (g_nl - L - 1) * sizeof(size_t));
+        memmove(g_lm + L + 1 + k, g_lm + L + 1, (g_nl - L - 1) * sizeof(LineMeta));
+        memset(g_lm + L + 1, 0, k * sizeof(LineMeta));
         for (size_t j = L + 1 + k; j < g_nl + k; j++) g_ls[j] += n;
         size_t w = L + 1;
         for (size_t i = 0; i < n; i++) if (s[i] == L'\n') g_ls[w++] = p + i + 1;
-        g_nl += k;
+        g_nl += k; g_rowsSum += (long long)k; g_tcL = 0; g_tcS = 0;
     }
+    if (g_npc > PIECES_COMPACT) Compact();
     g_docVer++;
 }
 static void RawDelete(size_t p, size_t n) {
     if (!n) return;
     size_t L = LineOf(p), Le = LineOf(p + n);
-    GapMove(p); g_ge += n;
+    LineEdited(L, p - LineStart(L));
+    PtDelete(p, n);
     size_t k = Le - L;
     if (k == 0) ShiftFrom(L + 1, -(ptrdiff_t)n);
     else {
         FlushDelta();
+        for (size_t j = L + 1; j <= Le; j++) { g_rowsSum -= RowsK(j); InfoFree(j); }
         memmove(g_ls + L + 1, g_ls + Le + 1, (g_nl - Le - 1) * sizeof(size_t));
+        memmove(g_lm + L + 1, g_lm + Le + 1, (g_nl - Le - 1) * sizeof(LineMeta));
         g_nl -= k;
         for (size_t j = L + 1; j < g_nl; j++) g_ls[j] -= n;
+        g_tcL = 0; g_tcS = 0;
     }
+    if (g_bgL > g_nl) g_bgL = g_nl;
+    if (g_npc > PIECES_COMPACT) Compact();
     g_docVer++;
 }
 
@@ -271,6 +377,10 @@ static void CompleteComposition(void);
 static void UpdateImeWindows(void);
 static void OnKeyDown(WPARAM vk);
 static void SetupFont(void);
+static void Invalidate(void);
+static int Sc(int v);
+static BOOL g_dirty = TRUE;                 /* back buffer must be fully re-rendered */
+static BOOL IdleWork(void);
 
 /* ================================================================== */
 /* undo / redo                                                         */
@@ -409,108 +519,262 @@ static void WordAt(size_t p, size_t *a, size_t *b) {
 }
 
 /* ================================================================== */
-/* layout: ONE measurement path (MeasureLine) used by drawing, caret,  */
+/* measurement and layout. ONE source of x positions (MeasureRun with  */
+/* the width dictionary) used by drawing (as ExtTextOut lpDx), caret,  */
 /* hit testing, composition, IME positions, wrapping and extents       */
 /* ================================================================== */
-static WCHAR *g_lb; static int *g_lx; static int *g_dx; static size_t g_lcap;
-static int *g_rows; static int g_nrows; static size_t g_rcap;
-static int g_layN, g_layCo;
-static size_t g_layL = (size_t)-1; static int g_layComp; static unsigned g_layDV, g_layCV, g_layLV;
-
-static void LineCap(size_t n) {
-    if (n + 2 <= g_lcap) return;
-    g_lcap = n + 256;
-    g_lb = xrealloc(g_lb, g_lcap * sizeof(WCHAR));
-    g_lx = xrealloc(g_lx, g_lcap * sizeof(int));
-    g_dx = xrealloc(g_dx, g_lcap * sizeof(int));
+/* ---- width dictionary: advance width per character for the current font (font / zoom / DPI) ---- */
+static unsigned short *g_wbmp;              /* BMP: 0xFFFF = not measured yet */
+typedef struct { UINT cp; int w; } WEnt;
+static WEnt *g_wsup; static size_t g_wsupN, g_wsupCap;   /* supplementary planes (open addressing) */
+static unsigned g_gdiCalls;                 /* number of GDI measurements (statistics) */
+static void DictReset(void) {
+    if (!g_wbmp) g_wbmp = xmalloc(65536 * sizeof *g_wbmp);
+    memset(g_wbmp, 0xFF, 65536 * sizeof *g_wbmp);
+    free(g_wsup); g_wsup = NULL; g_wsupN = g_wsupCap = 0;
 }
-static int BuildLine(size_t L, BOOL withComp, int *co) {
-    size_t s = LineStart(L), e = LineEnd(L), n = e - s;
-    int off = -1;
-    if (withComp && g_comp && g_clen > 0 && LineOf(g_cpos) == L) off = (int)(g_cpos - s);
-    size_t tot = n + (off >= 0 ? (size_t)g_clen : 0);
-    LineCap(tot);
-    if (off >= 0) {
-        DocGet(s, (size_t)off, g_lb);
-        memcpy(g_lb + off, g_cstr, (size_t)g_clen * sizeof(WCHAR));
-        DocGet(g_cpos, e - g_cpos, g_lb + off + g_clen);
-    } else DocGet(s, n, g_lb);
-    if (co) *co = off;
-    return (int)tot;
+static int GdiW(const WCHAR *s, int n) { SIZE z = { 0, 0 }; GetTextExtentPoint32W(g_hdcM, s, n, &z); g_gdiCalls++; return z.cx; }
+static BOOL ZeroWidthCp(UINT c) {
+    return c < 0x20 || IsExtender(c) || (c >= 0x200B && c <= 0x200F) || (c >= 0x2060 && c <= 0x2064) || c == 0xFEFF;
 }
-/* g_lx[i] = x (px from line start) of the boundary before unit i; g_lx[n] = width */
-static void MeasureLine(int n) {
-    int x = 0, i = 0;
-    while (i < n) {
-        if (g_lb[i] == L'\t') { g_lx[i] = x; x = (x / g_tabW + 1) * g_tabW; i++; continue; }
-        int j = i; while (j < n && g_lb[j] != L'\t') j++;
-        int k = 0;
-        while (k < j - i) {
-            int cn = j - i - k;
-            if (cn > 8192) { cn = 8192; if (IS_HI(g_lb[i + k + cn - 1])) cn--; }
-            /* lpnDx is only valid for the first *lpnFit chars -> ask for everything (INT_MAX) */
-            SIZE sz = { 0, 0 }; int fit = 0;
-            if (!GetTextExtentExPointW(g_hdcM, g_lb + i + k, cn, INT_MAX, &fit, g_dx, &sz) || fit < cn) {
-                for (int t = 1; t <= cn; t++) { SIZE z; GetTextExtentPoint32W(g_hdcM, g_lb + i + k, t, &z); g_dx[t - 1] = z.cx; }
-                sz.cx = g_dx[cn - 1];
-            }
-            g_lx[i + k] = x;
-            for (int t = 1; t < cn; t++) g_lx[i + k + t] = x + g_dx[t - 1];
-            x += sz.cx; k += cn;
+static BOOL WideCp(UINT c) {
+    return (c >= 0x1100 && c <= 0x115F) || (c >= 0x2E80 && c <= 0xA4CF) || (c >= 0xAC00 && c <= 0xD7A3) ||
+           (c >= 0xF900 && c <= 0xFAFF) || (c >= 0xFE30 && c <= 0xFE4F) || (c >= 0xFF00 && c <= 0xFF60) ||
+           (c >= 0xFFE0 && c <= 0xFFE6) || (c >= 0x1F300 && c <= 0x1FAFF) || (c >= 0x20000 && c <= 0x3FFFD);
+}
+/* a visible character that measures 0 (no glyph even through font linking) still gets a cell,
+   so the caret and the mouse can reach it; drawing uses the same width */
+static int FixW(UINT c, int w) { return (w > 0 || ZeroWidthCp(c)) ? w : (WideCp(c) ? 2 : 1) * g_avgW; }
+static int CharW(UINT c) {
+    if (c < 0x10000) {
+        if (g_wbmp[c] == 0xFFFF) { WCHAR s = (WCHAR)c; int w = FixW(c, GdiW(&s, 1)); g_wbmp[c] = (unsigned short)(w < 0xFFFE ? w : 0xFFFE); }
+        return g_wbmp[c];
+    }
+    if (g_wsupN * 2 >= g_wsupCap) {         /* grow + rehash */
+        WEnt *o = g_wsup; size_t oc = g_wsupCap;
+        g_wsupCap = oc ? oc * 2 : 256; g_wsup = calloc(g_wsupCap, sizeof(WEnt)); if (!g_wsup) xrealloc(NULL, (size_t)-1);
+        for (size_t i = 0; i < oc; i++) if (o[i].cp) {
+            size_t h = (o[i].cp * 2654435761u) & (g_wsupCap - 1);
+            while (g_wsup[h].cp) h = (h + 1) & (g_wsupCap - 1);
+            g_wsup[h] = o[i];
         }
+        free(o);
+    }
+    size_t h = (c * 2654435761u) & (g_wsupCap - 1);
+    while (g_wsup[h].cp && g_wsup[h].cp != c) h = (h + 1) & (g_wsupCap - 1);
+    if (!g_wsup[h].cp) {
+        WCHAR s[2] = { (WCHAR)(0xD800 + ((c - 0x10000) >> 10)), (WCHAR)(0xDC00 + ((c - 0x10000) & 0x3FF)) };
+        g_wsup[h].cp = c; g_wsup[h].w = FixW(c, GdiW(s, 2)); g_wsupN++;
+    }
+    return g_wsup[h].w;
+}
+/* width of the cluster t[i, j): one character from the dictionary; a cluster with combining marks,
+   variation selectors or ZWJ is measured as a whole (rare) */
+static int ClusterW(const WCHAR *t, int i, int j) {
+    int u; UINT c = (UINT)BufCp(t, j, i, &u);
+    return i + u >= j ? CharW(c) : FixW(c, GdiW(t + i, j - i));
+}
+/* x positions of t[0, m) starting at line x: xs[k] = x before unit k (units inside a cluster get the
+   x after it, so xs[k + 1] - xs[k] is the ExtTextOut lpDx). Stops at the first cluster boundary >= lim,
+   or before a cluster that may continue past the buffer (!atEnd). ck: record checkpoints (base = index of t[0]). */
+static int MeasureRun(const WCHAR *t, int m, BOOL atEnd, int lim, int x, int *xs, LineInfo *ck, int base) {
+    int i = 0;
+    while (i < lim && i < m) {
+        if (ck && base + i >= ck->ck[ck->nck - 1].i + CK) {
+            if (ck->nck == ck->cck) { ck->cck *= 2; ck->ck = xrealloc(ck->ck, (size_t)ck->cck * sizeof(Mark)); }
+            ck->ck[ck->nck].i = base + i; ck->ck[ck->nck++].x = x;
+        }
+        if (t[i] == L'\t') { xs[i++] = x; x = (x / g_tabW + 1) * g_tabW; continue; }
+        int j = BufNext(t, m, i);
+        if (j >= m && !atEnd) break;
+        xs[i] = x; x += ClusterW(t, i, j);
+        for (int k = i + 1; k < j; k++) xs[k] = x;
         i = j;
     }
-    g_lx[n] = x;
-    for (int t = 1; t < n; t++) if (IS_LO(g_lb[t]) && IS_HI(g_lb[t - 1])) g_lx[t] = g_lx[t - 1];
-    if (!g_wrap && x > g_maxW) g_maxW = x;
+    xs[i] = x;
+    return i;
 }
+
+/* ---- a display line: document line L with the composition string inserted at co ---- */
+typedef struct { size_t L; int co, n; LineInfo *li; } Ln;
+static LineInfo g_ci; static size_t g_ciL = (size_t)-1; static unsigned g_ciDV, g_ciCV;   /* composition line */
+static Ln LnOf(size_t L, BOOL withComp) {
+    Ln ln; size_t s = LineStart(L);
+    ln.L = L; ln.co = -1; ln.n = (int)(LineEnd(L) - s);
+    if (withComp && g_comp && g_clen > 0 && LineOf(g_cpos) == L) {
+        ln.co = (int)(g_cpos - s); ln.n += g_clen; ln.li = &g_ci;
+        if (g_ciL != L || g_ciDV != g_docVer || g_ciCV != g_compVer) { InfoReset(&g_ci); g_ciL = L; g_ciDV = g_docVer; g_ciCV = g_compVer; }
+    } else {
+        if (!g_lm[L].li) { g_lm[L].li = calloc(1, sizeof(LineInfo)); if (!g_lm[L].li) xrealloc(NULL, (size_t)-1); InfoReset(g_lm[L].li); g_ninfo++; }
+        ln.li = g_lm[L].li;
+    }
+    return ln;
+}
+static void LnGet(const Ln *ln, int a, int n, WCHAR *d) {
+    size_t s = LineStart(ln->L);
+    if (ln->co >= 0 && a < ln->co + g_clen) {
+        if (a < ln->co) { int k = n < ln->co - a ? n : ln->co - a; DocGet(s + (size_t)a, (size_t)k, d); d += k; a += k; n -= k; }
+        int k = n < ln->co + g_clen - a ? n : ln->co + g_clen - a;
+        if (k > 0) { memcpy(d, g_cstr + (a - ln->co), (size_t)k * sizeof(WCHAR)); d += k; a += k; n -= k; }
+    }
+    if (n > 0) DocGet(s + (size_t)a - (size_t)(ln->co >= 0 ? g_clen : 0), (size_t)n, d);
+}
+/* text + positions buffers: g_scr is scratch, g_win holds the window the caller is drawing / hit testing */
+typedef struct { WCHAR *t; int *x; int cap; } TBuf;
+static TBuf g_scr, g_win;
+static unsigned g_winId; static int g_lo, g_hi;          /* g_win covers display units [g_lo, g_hi] */
+#define LB(i) g_win.t[(i) - g_lo]
+#define LX(i) g_win.x[(i) - g_lo]
+/* measures ln from unit a (a cluster boundary at line x) up to the first boundary >= lim into b
+   (b->t[k - a], b->x[k - a]); returns that boundary */
+static int ScanFrom(TBuf *b, const Ln *ln, int a, int x, int lim, LineInfo *ck) {
+    for (int pad = 32;; pad *= 8) {
+        int m = lim - a + pad; if (m > ln->n - a) m = ln->n - a;
+        if (m + 2 > b->cap) { b->cap = m + 1024; b->t = xrealloc(b->t, (size_t)b->cap * sizeof(WCHAR)); b->x = xrealloc(b->x, (size_t)b->cap * sizeof(int)); }
+        LnGet(ln, a, m, b->t);
+        int r = MeasureRun(b->t, m, a + m == ln->n, lim - a, x, b->x, ck, a);
+        if (a + r >= lim || a + m == ln->n) return a + r;
+        ck = NULL;                          /* a huge cluster at the buffer end: read more and retry */
+    }
+}
+/* extends the measured prefix of ln to at least unit upto (in bounded steps, recording checkpoints) */
+static void Measure(const Ln *ln, int upto) {
+    LineInfo *li = ln->li;
+    if (upto > ln->n) upto = ln->n;
+    while (li->mi < upto) {
+        int lim = upto - li->mi > 16384 ? li->mi + 16384 : upto;
+        int r = ScanFrom(&g_scr, ln, li->mi, li->mx, lim, li);
+        li->mx = g_scr.x[r - li->mi]; li->mi = r;
+    }
+}
+static BOOL Measured(const Ln *ln) { return ln->li->mi >= ln->n; }
+/* line width: exact when measured to the end, otherwise extrapolated (provisional, for the scrollbar) */
+static int LineWidth(const Ln *ln) {
+    const LineInfo *li = ln->li;
+    if (li->mi >= ln->n || li->mi <= 0) return li->mx;
+    long long w = (long long)li->mx * ln->n / li->mi;
+    return w > INT_MAX / 2 ? INT_MAX / 2 : (int)w;
+}
+static const Mark *CkAt(const LineInfo *li, int i) {     /* last checkpoint at or before unit i */
+    int lo = 0, hi = li->nck - 1;
+    while (lo < hi) { int m = (lo + hi + 1) / 2; if (li->ck[m].i <= i) lo = m; else hi = m - 1; }
+    return &li->ck[lo];
+}
+static int XOf(const Ln *ln, int i) {       /* line x of unit i */
+    if (i <= 0) return 0;
+    if (i > ln->n) i = ln->n;
+    Measure(ln, i);
+    if (i == ln->li->mi) return ln->li->mx;
+    const Mark *c = CkAt(ln->li, i);
+    ScanFrom(&g_scr, ln, c->i, c->x, i, NULL);
+    return g_scr.x[i - c->i];
+}
+static int IdxAtX(const Ln *ln, int x) {    /* last cluster boundary whose line x is <= x */
+    LineInfo *li = ln->li;
+    if (x <= 0) return 0;
+    while (li->mi < ln->n && li->mx <= x) Measure(ln, li->mi + 4096);
+    int lo = 0, hi = li->nck - 1;           /* last checkpoint with x <= x */
+    while (lo < hi) { int m = (lo + hi + 1) / 2; if (li->ck[m].x <= x) lo = m; else hi = m - 1; }
+    const Mark *c = &li->ck[lo];
+    int end = lo + 1 < li->nck ? li->ck[lo + 1].i : li->mi;
+    int r = ScanFrom(&g_scr, ln, c->i, c->x, end, NULL), k = 0;
+    while (k < r - c->i && g_scr.x[k + 1] <= x) k++;
+    return c->i + k;
+}
+/* makes LB / LX valid for display units [a, b] of ln */
+static void Win(const Ln *ln, int a, int b) {
+    if (b > ln->n) b = ln->n;
+    if (a > b) a = b;
+    if (g_winId == ln->li->id && a >= g_lo && b <= g_hi) return;
+    Measure(ln, a);
+    const Mark *c = CkAt(ln->li, a);
+    g_lo = c->i; g_hi = ScanFrom(&g_win, ln, c->i, c->x, b, NULL); g_winId = ln->li->id;
+}
+
+/* ---- wrapping ---- */
 static int WrapW(void) { int w = g_cw - 2 * g_margin - g_caretW; return w < g_avgW * 2 ? g_avgW * 2 : w; }
 static BOOL IsCJK(WCHAR c) { return c >= 0x2E80; }
 static BOOL NoLineStart(WCHAR c) { return c && wcschr(L"、。，．・：；？！゛゜ヽヾゝゞ々ー）］｝」』】〕〉》’”ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ!),.:;?]}", c) != NULL; }
-static void RowsReserve(size_t n) { if (n > g_rcap) { g_rcap = n + 64; g_rows = xrealloc(g_rows, g_rcap * sizeof(int)); } }
-static void ComputeRows(int n) {
-    RowsReserve(4);
-    g_nrows = 1; g_rows[0] = 0;
-    if (!g_wrap) return;
-    int W = WrapW(), start = 0, opp = -1, i = 0;
-    while (i < n) {
-        int j = BufNext(g_lb, n, i);
-        if (i > start && (g_lb[i - 1] == L' ' || g_lb[i - 1] == L'\t' || g_lb[i - 1] == 0x3000 || IsCJK(g_lb[i]) || IsCJK(g_lb[i - 1])))
-            opp = i;
-        if (g_lx[j] - g_lx[start] > W && i > start) {
-            int brk = opp > start ? opp : i;
-            /* simple kinsoku: do not start a row with closing punctuation */
-            if (brk == i && NoLineStart(g_lb[brk]) && opp <= start) {
-                int pb = brk; int q = start, prev = start;
-                while (q < pb) { prev = q; q = BufNext(g_lb, n, q); }
-                if (prev > start) brk = prev;
+/* start of the row after the row starting at s (ln->n if the rest fits): break at a space / CJK
+   boundary, simple kinsoku (no closing punctuation at a row start) */
+static int NextBreak(const Ln *ln, int s, int W) {
+    int x0 = XOf(ln, s);
+    for (int span = 256 + 4 * W / (g_avgW > 0 ? g_avgW : 1);; span *= 4) {
+        int r = ScanFrom(&g_scr, ln, s, x0, s + span < ln->n ? s + span : ln->n, NULL) - s;
+        const WCHAR *t = g_scr.t; const int *xs = g_scr.x;
+        int opp = -1, i = 0;
+        while (i < r) {
+            int j = BufNext(t, r, i);
+            if (i > 0 && (t[i - 1] == L' ' || t[i - 1] == L'\t' || t[i - 1] == 0x3000 || IsCJK(t[i]) || IsCJK(t[i - 1]))) opp = i;
+            if (xs[j] - xs[0] > W && i > 0) {
+                int brk = opp > 0 ? opp : i;
+                if (brk == i && NoLineStart(t[brk]) && opp <= 0) {
+                    int q = 0, prev = 0;
+                    while (q < brk) { prev = q; q = BufNext(t, r, q); }
+                    if (prev > 0) brk = prev;
+                }
+                return s + brk;
             }
-            RowsReserve((size_t)g_nrows + 2);
-            g_rows[g_nrows++] = brk;
-            start = brk; opp = -1;
-            if (brk < i) { i = brk; }
-            continue;
+            i = j;
         }
-        i = j;
+        if (s + r >= ln->n) return ln->n;
     }
 }
-/* lays out line L into g_lb/g_lx/g_rows (cached by line + versions) and returns its length */
-static int LayoutLine(size_t L, BOOL withComp) {
-    BOOL eff = withComp && g_comp && g_clen > 0 && LineOf(g_cpos) == L;
-    if (g_layL == L && g_layComp == eff && g_layDV == g_docVer && g_layCV == g_compVer && g_layLV == g_layoutVer)
-        return g_layN;
-    g_layN = BuildLine(L, eff, &g_layCo);
-    MeasureLine(g_layN);
-    ComputeRows(g_layN);
-    g_layL = L; g_layComp = eff; g_layDV = g_docVer; g_layCV = g_compVer; g_layLV = g_layoutVer;
-    return g_layN;
+/* finds rows of ln until at least want rows are known or all are; returns the number known */
+static int EnsureRows(const Ln *ln, int want) {
+    LineInfo *li = ln->li; int W = g_wrap ? WrapW() : 0;
+    if (li->rw != W || !li->nr || !W) {     /* no wrap: one row */
+        if (!li->cr) { li->cr = 4; li->rows = xmalloc(4 * sizeof(int)); }
+        li->nr = 1; li->rows[0] = 0; li->rw = W; li->rdone = !W || !ln->n;
+    }
+    while (!li->rdone && li->nr < want) {
+        int b = NextBreak(ln, li->rows[li->nr - 1], W);
+        if (b >= ln->n) { li->rdone = TRUE; break; }
+        if (li->nr == li->cr) { li->cr *= 2; li->rows = xrealloc(li->rows, (size_t)li->cr * sizeof(int)); }
+        li->rows[li->nr++] = b;
+    }
+    if (li->rdone && W && ln->co < 0 && W == g_rowsW && g_lm[ln->L].rows != li->nr) SetRowCount(ln->L, li->nr);
+    return li->nr;
 }
-static int RowOf(int idx) { for (int r = g_nrows - 1; r > 0; r--) if (g_rows[r] <= idx) return r; return 0; }
-static int RowEnd(int r) { return r + 1 < g_nrows ? g_rows[r + 1] : g_layN; }
-static int RowX(int idx, int r) { return g_lx[idx] - g_lx[g_rows[r]]; }
+static void RowCountsCheck(void) {          /* known row counts belong to one wrap width */
+    int W = g_wrap ? WrapW() : -1;
+    if (W == g_rowsW) return;
+    for (size_t L = 0; L < g_nl; L++) g_lm[L].rows = 0;
+    g_rowsSum = (long long)g_nl; g_rowsW = W; g_bgL = 0; g_tcL = 0; g_tcS = 0;
+}
+/* rows of line L (with composition); stops early once at least want rows are known */
+static int RowsAtLeast(size_t L, int want) {
+    if (!g_wrap) return 1;
+    RowCountsCheck();
+    if (g_lm[L].rows && !(g_comp && g_clen > 0 && LineOf(g_cpos) == L)) return g_lm[L].rows;
+    Ln ln = LnOf(L, TRUE);
+    return EnsureRows(&ln, want);
+}
+static int RowsOf(size_t L) { return RowsAtLeast(L, INT_MAX); }
+/* font / zoom / DPI changed: all widths are invalid */
+static void LayoutReset(void) {
+    for (size_t L = 0; L < g_nl; L++) InfoFree(L);
+    DictReset();
+    g_ciL = (size_t)-1; g_winId = 0; g_rowsW = -2;
+}
+
+/* ---- the current line (LayoutLine) and its rows ---- */
+static Ln g_ln;
+static int LayoutLine(size_t L, BOOL withComp) { g_ln = LnOf(L, withComp); return g_ln.n; }
+static BOOL HasRow(int r) { return EnsureRows(&g_ln, r + 1) > r; }
+static int RowStart(int r) { int nr = EnsureRows(&g_ln, r + 1); return g_ln.li->rows[r < nr ? r : nr - 1]; }
+static int RowEnd(int r) { return EnsureRows(&g_ln, r + 2) > r + 1 ? g_ln.li->rows[r + 1] : g_ln.n; }
+static int RowOf(int idx) {
+    LineInfo *li = g_ln.li;
+    EnsureRows(&g_ln, 1);
+    while (!li->rdone && li->rows[li->nr - 1] <= idx) EnsureRows(&g_ln, li->nr + 1);
+    int lo = 0, hi = li->nr - 1;
+    while (lo < hi) { int m = (lo + hi + 1) / 2; if (li->rows[m] <= idx) lo = m; else hi = m - 1; }
+    return lo;
+}
+static int RowX(int idx, int r) { return XOf(&g_ln, idx) - XOf(&g_ln, RowStart(r)); }
 static int XClient(int x) { return x + g_margin - (g_wrap ? 0 : g_sx); }
 static int VisLines(void) { int v = g_ch / g_lineH; return v < 1 ? 1 : v; }
-static int RowsOf(size_t L) { if (!g_wrap) return 1; LayoutLine(L, TRUE); return g_nrows; }
 static int CmpLR(size_t L1, int r1, size_t L2, int r2) { if (L1 != L2) return L1 < L2 ? -1 : 1; return r1 < r2 ? -1 : (r1 > r2); }
 /* rows from (L1,r1) to (L2,r2); |result| capped at limit+1 */
 static long long RowDelta(size_t L1, int r1, size_t L2, int r2, long long limit) {
@@ -519,8 +783,9 @@ static long long RowDelta(size_t L1, int r1, size_t L2, int r2, long long limit)
     if (c == 0) return 0;
     if (c > 0) return -RowDelta(L2, r2, L1, r1, limit);
     if (L1 == L2) return r2 - r1;
-    long long cnt = RowsOf(L1) - r1;
-    for (size_t L = L1 + 1; L < L2; L++) { if (cnt > limit) return limit + 1; cnt += RowsOf(L); }
+    int lim = limit > INT_MAX / 4 ? INT_MAX / 4 : (int)limit;
+    long long cnt = RowsAtLeast(L1, r1 + lim + 2) - r1;
+    for (size_t L = L1 + 1; L < L2; L++) { if (cnt > limit) return limit + 1; cnt += RowsAtLeast(L, lim + 2); }
     cnt += r2;
     return cnt > limit ? limit + 1 : cnt;
 }
@@ -537,7 +802,7 @@ static long long StepRows(size_t *L, int *r, long long d) {
     long long moved = 0;
     if (d > 0) {
         while (d > 0) {
-            int nr = RowsOf(*L);
+            int nr = RowsAtLeast(*L, d > INT_MAX / 4 ? INT_MAX / 4 : *r + (int)d + 1);
             if (*r + d < nr) { *r += (int)d; moved += d; break; }
             if (*L + 1 >= g_nl) { moved += nr - 1 - *r; *r = nr - 1; break; }
             d -= nr - *r; moved += nr - *r; (*L)++; *r = 0;
@@ -551,12 +816,6 @@ static long long StepRows(size_t *L, int *r, long long d) {
     }
     return moved;
 }
-static void MaxTop(size_t *L, int *r) {
-    int vis = VisLines();
-    if (!g_wrap) { *L = g_nl > (size_t)vis ? g_nl - (size_t)vis : 0; *r = 0; return; }
-    *L = g_nl - 1; *r = RowsOf(*L) - 1;
-    StepRows(L, r, -(long long)(vis - 1));
-}
 static int RowY(size_t L, int r) {
     long long d = RowDelta(g_top, g_topRow, L, r, VisLines() + 2);
     if (d > 100000) d = 100000;
@@ -568,11 +827,11 @@ static void CaretInfo(POINT *pt, size_t *pL, int *pr) {
     size_t L; int idx, r, x;
     if (g_comp && g_clen > 0) {
         L = LineOf(g_cpos); LayoutLine(L, TRUE);
-        idx = g_layCo + g_ccur; r = RowOf(idx); x = RowX(idx, r);
+        idx = g_ln.co + g_ccur; r = RowOf(idx); x = RowX(idx, r);
     } else {
         L = LineOf(g_caret); LayoutLine(L, FALSE);
         idx = (int)(g_caret - LineStart(L)); r = RowOf(idx);
-        if (g_aff && r > 0 && g_rows[r] == idx) r--;
+        if (g_aff && r > 0 && RowStart(r) == idx) r--;
         x = RowX(idx, r);
     }
     pt->x = XClient(x); pt->y = RowY(L, r);
@@ -588,23 +847,27 @@ static void IdxPoint(size_t L, int idx, POINT *pt) {
 }
 static size_t PosAtRowX(size_t L, int r, int px, BOOL *aff) {
     LayoutLine(L, FALSE);
-    if (r >= g_nrows) r = g_nrows - 1;
-    int a = g_rows[r], b = RowEnd(r);
+    int nr = EnsureRows(&g_ln, r + 2);
+    if (r >= nr) r = nr - 1;
+    BOOL more = r + 1 < nr;
+    int a = RowStart(r), b = RowEnd(r), base = XOf(&g_ln, a);
     size_t s = LineStart(L);
     if (aff) *aff = FALSE;
     if (px <= 0) return s + (size_t)a;
-    int q = a;
+    int q = IdxAtX(&g_ln, base + px);
+    if (q < a) q = a;
     while (q < b) {
-        int nq = BufNext(g_lb, g_layN, q); if (nq > b) nq = b;
-        int x0 = g_lx[q] - g_lx[a], x1 = g_lx[nq] - g_lx[a];
+        Win(&g_ln, q, q + 1);
+        int nq = q + BufNext(&LB(q), g_hi - q, 0); if (nq > b) nq = b;
+        int x0 = LX(q) - base, x1 = LX(nq) - base;
         if (px < x1) {
             int res = (px - x0 < x1 - px) ? q : nq;
-            if (aff && res == b && r + 1 < g_nrows) *aff = TRUE;
+            if (aff && res == b && more) *aff = TRUE;
             return s + (size_t)res;
         }
         q = nq;
     }
-    if (aff && r + 1 < g_nrows) *aff = TRUE;
+    if (aff && more) *aff = TRUE;
     return s + (size_t)b;
 }
 static size_t PosFromPointEx(int x, int y, BOOL *aff) {
@@ -628,10 +891,14 @@ static void ClampScroll(void) {
         return;
     }
     if (g_top >= g_nl) { g_top = g_nl - 1; g_topRow = 0; }
-    if (g_wrap) { int nr = RowsOf(g_top); if (g_topRow >= nr) g_topRow = nr - 1; if (g_topRow < 0) g_topRow = 0; }
+    if (g_topRow < 0) g_topRow = 0;
+    if (g_wrap) { int nr = RowsAtLeast(g_top, g_topRow + 1); if (g_topRow >= nr) g_topRow = nr - 1; }
     else g_topRow = 0;
-    size_t mL; int mR; MaxTop(&mL, &mR);
-    if (CmpLR(g_top, g_topRow, mL, mR) > 0) { g_top = mL; g_topRow = mR; }
+    /* keep the last row at the bottom: look vis-1 rows ahead (only rows that are needed get laid out) */
+    long long want = VisLines() - 1;
+    size_t L = g_top; int r = g_topRow;
+    long long moved = StepRows(&L, &r, want);
+    if (moved < want) StepRows(&g_top, &g_topRow, moved - want);
     if (g_wrap) g_sx = 0;
     else {
         int maxSx = ContentW() - g_cw; if (maxSx < 0) maxSx = 0;
@@ -639,17 +906,19 @@ static void ClampScroll(void) {
         if (g_sx < 0) g_sx = 0;
     }
 }
-/* exact row metrics for wrapped documents up to this many lines */
+/* wrap mode scrollbar unit = rows. Lines whose row count is not known yet count as one row; idle
+   time fills the counts in, so the bar becomes exact. Small documents are counted at once. */
 #define WRAP_EXACT_LINES 400
-static unsigned g_trDV, g_trLV, g_trCV; static long long g_trTotal = -1;
-static long long WrapTotalRows(void) {
-    if (g_trDV == g_docVer && g_trLV == g_layoutVer && g_trCV == g_compVer && g_trTotal >= 0) return g_trTotal;
-    long long t = 0;
-    for (size_t L = 0; L < g_nl; L++) t += RowsOf(L);
-    g_trDV = g_docVer; g_trLV = g_layoutVer; g_trCV = g_compVer; g_trTotal = t;
-    return t;
+static long long TopRowIndex(void) {
+    while (g_tcL < g_top) g_tcS += RowsK(g_tcL++);
+    while (g_tcL > g_top) g_tcS -= RowsK(--g_tcL);
+    return g_tcS + g_topRow;
 }
-static long long WrapTopIndex(void) { long long t = 0; for (size_t L = 0; L < g_top; L++) t += RowsOf(L); return t + g_topRow; }
+static void TopFromRowIndex(long long t) {
+    size_t L = 0;
+    while (L + 1 < g_nl && t >= RowsK(L)) t -= RowsK(L++);
+    g_top = L; g_topRow = (int)t;
+}
 static void UpdateScrollBars(void) {
     static BOOL busy;
     if (busy || !g_hwnd) return;
@@ -659,9 +928,13 @@ static void UpdateScrollBars(void) {
         ClampScroll();
         SCROLLINFO si = { sizeof si, SIF_RANGE | SIF_PAGE | SIF_POS, 0, 0, 0, 0, 0 };
         if (g_mdView) { si.nMax = g_mdH - 1; si.nPage = (UINT)(g_ch > 0 ? g_ch : 1); si.nPos = g_mdTop; }
-        else if (g_wrap && g_nl <= WRAP_EXACT_LINES) {
-            long long t = WrapTotalRows();
-            si.nMax = (int)(t - 1); si.nPage = (UINT)VisLines(); si.nPos = (int)WrapTopIndex();
+        else if (g_wrap) {
+            RowCountsCheck();
+            if (g_nl <= WRAP_EXACT_LINES) for (size_t L = 0; L < g_nl; L++) RowsOf(L);
+            long long t = g_rowsSum - 1, p = TopRowIndex();
+            if (t > 0x7FFFFFF) t = 0x7FFFFFF;
+            if (p > t) p = t;
+            si.nMax = (int)t; si.nPage = (UINT)VisLines(); si.nPos = (int)p;
         } else {
             si.nMax = g_nl - 1 > 0x7FFFFFF ? 0x7FFFFFF : (int)(g_nl - 1);
             si.nPage = (UINT)VisLines(); si.nPos = (int)g_top;
@@ -801,24 +1074,22 @@ static void CutSel(void) {
 }
 
 /* ================================================================== */
-/* file I/O (large-file aware: decode straight into the gap buffer)    */
+/* file I/O (large-file aware: decode straight into the original text) */
 /* ================================================================== */
 static void ResetDoc(void) {
     OpClear(&g_undo); OpClear(&g_redo);
     g_caret = g_anchor = 0; g_top = 0; g_topRow = 0; g_sx = 0; g_maxW = 0; g_wantX = -1; g_aff = FALSE;
     g_modified = FALSE; BreakUndoMerge(); g_docVer++;
 }
-/* takes ownership of buf (capacity cap, text length n) */
-static void AdoptDoc(WCHAR *buf, size_t n, size_t cap) {
-    free(g_buf);
-    g_buf = buf; g_cap = cap; g_gs = n; g_ge = cap;
+/* takes ownership of buf (text length n): it becomes the immutable original text */
+static void AdoptDoc(WCHAR *buf, size_t n) {
+    PtAdopt(buf, n);
     RebuildLines(); g_docVer++;
 }
 static void SetDocText(const WCHAR *t, size_t n) {
-    size_t cap = n + 1024;
-    WCHAR *b = xmalloc(cap * sizeof(WCHAR));
+    WCHAR *b = xmalloc((n + 1) * sizeof(WCHAR));
     if (n) memcpy(b, t, n * sizeof(WCHAR));
-    AdoptDoc(b, n, cap);
+    AdoptDoc(b, n);
 }
 static BOOL g_loadQuiet;
 static BOOL LoadFile(const WCHAR *path) {
@@ -837,22 +1108,22 @@ static BOOL LoadFile(const WCHAR *path) {
     int enc = 0; const char *src = (const char *)b; int sn = (int)n; UINT cp = CP_UTF8;
     if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) { enc = 1; src += 3; sn -= 3; }
     else if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE) enc = 3;
-    WCHAR *w; size_t wn, cap;
+    WCHAR *w; size_t wn;
     if (enc == 3) {
-        wn = (n - 2) / 2; cap = wn + wn / 16 + 4096;
-        w = malloc(cap * sizeof(WCHAR));
+        wn = (n - 2) / 2;
+        w = malloc((wn + 1) * sizeof(WCHAR));
         if (w) memcpy(w, b + 2, wn * 2);
     } else {
         int need = sn ? MultiByteToWideChar(CP_UTF8, enc == 1 ? 0 : MB_ERR_INVALID_CHARS, src, sn, NULL, 0) : 0;
         if (sn && need == 0) { enc = 2; cp = 932; need = MultiByteToWideChar(932, 0, src, sn, NULL, 0); }
-        wn = (size_t)need; cap = wn + wn / 16 + 4096;
-        w = malloc(cap * sizeof(WCHAR));
+        wn = (size_t)need;
+        w = malloc((wn + 1) * sizeof(WCHAR));
         if (w && sn) MultiByteToWideChar(cp, 0, src, sn, w, need);
     }
     free(b);
     if (!w) { SetCursor(oc); MessageBoxW(g_frame, L"メモリ不足です。", APPNAME, MB_ICONERROR); return FALSE; }
     wn = NormalizeNewlines(w, wn);
-    AdoptDoc(w, wn, cap);
+    AdoptDoc(w, wn);
     ResetDoc(); g_enc = enc;
     wcsncpy(g_path, path, sizeof g_path / sizeof g_path[0] - 1);
     g_maxW = 0; g_layoutVer++;
@@ -885,6 +1156,7 @@ static BOOL SaveFile(const WCHAR *path) {
     CloseHandle(f);
     if (!ok) { MessageBoxW(g_frame, L"保存に失敗しました。", APPNAME, MB_ICONERROR); return FALSE; }
     g_enc = enc; g_modified = FALSE;
+    Compact();                              /* the saved text becomes the new original: one piece */
     if (path != g_path) wcsncpy(g_path, path, sizeof g_path / sizeof g_path[0] - 1);
     UpdateTitle();
     return TRUE;
@@ -1019,6 +1291,7 @@ static void SetupFont(void) {
     DWORD cw = 1; SystemParametersInfoW(SPI_GETCARETWIDTH, 0, &cw, 0);
     g_caretW = MulDiv((int)(cw < 1 ? 1 : cw), (int)g_dpi, 96); if (g_caretW < 1) g_caretW = 1;
     g_maxW = 0; g_layoutVer++;
+    LayoutReset(); g_dirty = TRUE;          /* widths depend on font / zoom / DPI */
     /* UI fonts */
     if (g_uiFont) DeleteObject(g_uiFont);
     if (g_capFont) DeleteObject(g_capFont);
@@ -1050,7 +1323,7 @@ static void ImeGeometry(POINT *compPt, int *tx0, int *tx1, int *ty) {
     if (g_comp && g_clen > 0) {
         size_t L = LineOf(g_cpos);
         LayoutLine(L, TRUE);
-        int co = g_layCo, ta, tb; CompTarget(&ta, &tb);
+        int co = g_ln.co, ta, tb; CompTarget(&ta, &tb);
         int r = RowOf(co + ta), e = co + tb; if (e > RowEnd(r)) e = RowEnd(r);
         int x0 = RowX(co + ta, r), x1 = RowX(e, r);
         int rc = RowOf(co), xc = RowX(co, rc);
@@ -1090,14 +1363,6 @@ static void PlaceCaret(void) {
     if (g_focus && g_caretMade && !g_mdView) { POINT pt; CaretPoint(&pt, NULL); SetCaretPos(pt.x, pt.y); }
     if (g_focus && !g_mdView) UpdateImeWindows();
 }
-static void Refresh(BOOL ensure) {
-    if (!g_hwnd) return;
-    if (ensure) EnsureVisible();
-    UpdateScrollBars();
-    InvalidateRect(g_hwnd, NULL, FALSE);
-    PlaceCaret();
-}
-
 /* ================================================================== */
 /* find matches for painting                                           */
 /* ================================================================== */
@@ -1124,7 +1389,8 @@ static void LineMatches(size_t L) {
 }
 
 /* ================================================================== */
-/* painting                                                            */
+/* painting: persistent back buffer. A pure scroll shifts it (and the  */
+/* window, ScrollWindowEx) and draws only the newly exposed rows       */
 /* ================================================================== */
 static void FillR(HDC dc, int l, int t, int r, int b, COLORREF c) {
     RECT rc = { l, t, r, b }; SetBkColor(dc, c); ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &rc, NULL, 0, NULL);
@@ -1146,8 +1412,8 @@ static void DrawWsMarks(HDC dc, int a, int b, int ox, int y) {
     int u = Sc(1); if (u < 1) u = 1;
     int mid = y + g_lineH / 2;
     for (int i = a; i < b; i++) {
-        WCHAR c = g_lb[i];
-        int x0 = g_lx[i] + ox, x1 = g_lx[i + 1] + ox;
+        WCHAR c = LB(i);
+        int x0 = LX(i) + ox, x1 = LX(i + 1) + ox;
         if (c == L' ') {
             int cx = (x0 + x1) / 2, d = u + (u + 1) / 2;
             FillR(dc, cx - d / 2, mid - d / 2, cx - d / 2 + d, mid - d / 2 + d, C_WS);
@@ -1172,53 +1438,74 @@ static void DrawNewlineMark(HDC dc, int x, int y) {
     FillR(dc, x + u, by, bx, by + u, C_WS);              /* horizontal */
     for (int k = 1; k <= 3 * u; k++) { FillR(dc, x + u + k, by - k, x + 2 * u + k, by - k + u, C_WS); FillR(dc, x + u + k, by + k, x + 2 * u + k, by + k + u, C_WS); }
 }
+/* text of display units [i, j) at x0 with the measured advances, so the glyphs land exactly where the
+   caret, hit testing and underlines put them */
+static int *g_dxb; static int g_dxcap;
+/* lpDx for window units [i,j): the measured advances.  A surrogate pair's advance is split over its
+   two code units: GDI sums them when the pair is one glyph, and Wine draws a missing pair as two boxes. */
+static void RunDx(int i, int j, int *dx) {
+    for (int k = i; k < j; k++) dx[k - i] = LX(k + 1) - LX(k);
+    for (int k = i; k + 1 < j; k++)
+        if (IS_HI(LB(k)) && IS_LO(LB(k + 1)) && dx[k - i + 1] == 0) { dx[k - i + 1] = dx[k - i] / 2; dx[k - i] -= dx[k - i + 1]; k++; }
+}
+static void DrawRun(HDC dc, int x0, int y, int i, int j) {
+    if (j - i > g_dxcap) { g_dxcap = j - i + 256; g_dxb = xrealloc(g_dxb, (size_t)g_dxcap * sizeof(int)); }
+    RunDx(i, j, g_dxb);
+    ExtTextOutW(dc, x0, y, 0, NULL, &LB(i), (UINT)(j - i), g_dxb);
+}
 static void MdPaint(HDC dc, int w, int h);
-static void PaintText(HDC dc, int w, int h) {
+/* draws the text rows whose top lies in [y0, y1) (the caller clips and fills the background) */
+static void PaintRows(HDC dc, int w, int y0, int y1) {
     COLORREF sbg = (g_focus || GetFocus() == NULL) ? C_SEL : C_SEL_NF;
     size_t sa = SelA(), sb = SelB();
     if (HasSel() && sa == g_curMA && sb == g_curMB && g_findOpen) sbg = C_CURMATCH;
     size_t L = g_top; int r = g_topRow, y = 0;
     int thin = Sc(1); if (thin < 1) thin = 1;
-    if (!g_wrap) g_maxW = g_sx > 0 ? g_sx + g_cw - g_margin * 2 - g_caretW : 0;
-    while (y < h && L < g_nl) {
+    if (y0 >= g_lineH) y = (int)StepRows(&L, &r, y0 / g_lineH) * g_lineH;
+    while (y < y1 && L < g_nl) {
         LineMatches(L);
-        int n = LayoutLine(L, TRUE), co = g_layCo;
+        int n = LayoutLine(L, TRUE), co = g_ln.co;
         size_t s = LineStart(L), e = s + (size_t)n;
-        for (; r < g_nrows && y < h; r++, y += g_lineH) {
-            int a = g_rows[r], b = RowEnd(r);
-            int ox = XClient(0) - g_lx[a];
-            BOOL lastRow = (r == g_nrows - 1);
+        for (; y < y1 && HasRow(r); r++, y += g_lineH) {
+            int a = RowStart(r), b = RowEnd(r);
+            BOOL lastRow = !HasRow(r + 1);
+            int ox = XClient(0) - XOf(&g_ln, a), va = a, vb = b;
+            /* no wrap: only the part inside the window is measured and drawn */
+            if (!g_wrap) { va = IdxAtX(&g_ln, -ox); vb = IdxAtX(&g_ln, w - ox); if (vb < b) vb++; }
+            Win(&g_ln, va, vb);
+            if (vb > g_hi) vb = g_hi;
             /* find highlights */
             if (co < 0)
                 for (int k = 0; k < g_nfm; k += 2) {
-                    int ms = g_fm[k] > a ? g_fm[k] : a, me = g_fm[k + 1] < b ? g_fm[k + 1] : b;
-                    if (me > ms) FillR(dc, g_lx[ms] + ox, y, g_lx[me] + ox, y + g_lineH, C_MATCH);
+                    int ms = g_fm[k] > va ? g_fm[k] : va, me = g_fm[k + 1] < vb ? g_fm[k + 1] : vb;
+                    if (me > ms) FillR(dc, LX(ms) + ox, y, LX(me) + ox, y + g_lineH, C_MATCH);
                 }
             /* selection */
             if (sa != sb && co < 0 && sb > s + (size_t)a && sa <= s + (size_t)b) {
                 int ss = (int)((sa > s ? sa : s) - s), se = (int)((sb < e ? sb : e) - s);
-                if (ss < a) ss = a;
-                if (se > b) se = b;
-                int x0 = g_lx[ss] + ox, x1 = g_lx[se] + ox;
-                if (lastRow && sb > e) x1 += g_avgW;
+                if (ss < va) ss = va;
+                if (ss > vb) ss = vb;
+                if (se > vb) se = vb;
+                if (se < ss) se = ss;
+                int x0 = LX(ss) + ox, x1 = LX(se) + ox;
+                if (lastRow && sb > e && vb == n) x1 += g_avgW;
                 if (x1 > x0) FillR(dc, x0, y, x1, y + g_lineH, sbg);
             }
             /* text */
             SetTextColor(dc, C_TEXT);
-            int i = a;
-            while (i < b) {
-                if (g_lb[i] == L'\t') { i++; continue; }
+            for (int i = va; i < vb;) {
+                if (LB(i) == L'\t') { i++; continue; }
                 int j = i + 1;
-                while (j < b && g_lb[j] != L'\t' && j - i < 2048) j++;
-                if (j < b && IS_LO(g_lb[j])) j++;
-                int x0 = g_lx[i] + ox, x1 = g_lx[j] + ox;
-                if (x1 >= 0 && x0 <= w) ExtTextOutW(dc, x0, y, 0, NULL, g_lb + i, (UINT)(j - i), NULL);
+                while (j < vb && LB(j) != L'\t' && j - i < 2048) j++;
+                if (j < vb && IS_LO(LB(j))) j++;
+                int x0 = LX(i) + ox, x1 = LX(j) + ox;
+                if (x1 >= 0 && x0 <= w) DrawRun(dc, x0, y, i, j);
                 i = j;
             }
             if (g_showWs) {
-                DrawWsMarks(dc, a, b, ox, y);
-                if (lastRow) {
-                    int xe = g_lx[n] + ox + Sc(2);
+                DrawWsMarks(dc, va, vb, ox, y);
+                if (lastRow && vb == n) {
+                    int xe = LX(n) + ox + Sc(2);
                     if (L + 1 < g_nl) DrawNewlineMark(dc, xe, y);
                     else { SetTextColor(dc, C_WS); ExtTextOutW(dc, xe, y, 0, NULL, L"[EOF]", 5, NULL); }
                 }
@@ -1236,10 +1523,10 @@ static void PaintText(HDC dc, int w, int h) {
                     int m = k + 1;
                     while (m < cend && g_cattr[m] == at) m++;
                     int ua = co + k, ub = co + m;
-                    if (ua < a) ua = a;
-                    if (ub > b) ub = b;
+                    if (ua < va) ua = va;
+                    if (ub > vb) ub = vb;
                     if (ub > ua) {
-                        int x0 = g_lx[ua] + ox + (ua == co + k ? gap : 0), x1 = g_lx[ub] + ox - (ub == co + m ? gap : 0);
+                        int x0 = LX(ua) + ox + (ua == co + k ? gap : 0), x1 = LX(ub) + ox - (ub == co + m ? gap : 0);
                         if (x1 <= x0) x1 = x0 + 1;
                         DrawUnderline(dc, x0, x1, uy, at, at == ATTR_INPUT_ERROR ? RGB(255, 80, 80) : C_TEXT);
                     }
@@ -1250,21 +1537,93 @@ static void PaintText(HDC dc, int w, int h) {
         L++; r = 0;
     }
 }
-static void Paint(HDC hdc) {
+/* everything the picture depends on, except what Invalidate() reports */
+typedef struct {
+    size_t top, sa, sb, ma, mb; int topRow, sx, cw, ch, mdTop;
+    BOOL wrap, ws, md, findOpen, comp, focus;
+    unsigned docVer, compVer, layoutVer, findVer; const void *re;
+} ViewKey;
+static HDC g_bb; static HBITMAP g_bbBmp; static int g_bbW, g_bbH;
+static ViewKey g_vk;   /* the back buffer shows g_vk unless dirty */
+static void ViewKeyNow(ViewKey *k) {
+    memset(k, 0, sizeof *k);
+    k->top = g_top; k->topRow = g_topRow; k->sx = g_sx; k->cw = g_cw; k->ch = g_ch; k->mdTop = g_mdTop;
+    if (HasSel()) { k->sa = SelA(); k->sb = SelB(); }
+    k->ma = g_curMA; k->mb = g_curMB; k->wrap = g_wrap; k->ws = g_showWs; k->md = g_mdView;
+    k->findOpen = g_findOpen; k->comp = g_comp; k->focus = g_focus || GetFocus() == NULL;
+    k->docVer = g_docVer; k->compVer = g_compVer; k->layoutVer = g_layoutVer; k->findVer = g_findVer; k->re = g_re;
+}
+static void Invalidate(void) { g_dirty = TRUE; if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE); }
+/* no wrap: content width of the visible lines (provisional while a line is not measured to its end) */
+static void UpdateMaxW(void) {
+    if (g_wrap || g_mdView) return;
+    int m = g_sx > 0 ? g_sx + g_cw - g_margin * 2 - g_caretW : 0;
+    size_t L = g_top;
+    for (int k = 0; k <= VisLines() && L < g_nl; k++, L++) {
+        Ln ln = LnOf(L, TRUE);
+        IdxAtX(&ln, g_sx + g_cw);
+        int w = LineWidth(&ln); if (w > m) m = w;
+    }
+    g_maxW = m;
+}
+static void RenderStrip(int y0, int y1) {
+    int sv = SaveDC(g_bb);
+    IntersectClipRect(g_bb, 0, y0, g_bbW, y1);
+    SelectObject(g_bb, g_font);
+    FillR(g_bb, 0, y0, g_bbW, y1, C_BG);
+    SetBkMode(g_bb, TRANSPARENT);
+    SetTextAlign(g_bb, TA_TOP | TA_LEFT);
+    if (g_mdView) MdPaint(g_bb, g_bbW, g_bbH); else PaintRows(g_bb, g_bbW, y0, y1);
+    RestoreDC(g_bb, sv);
+}
+static void Paint(HDC hdc, const RECT *pr) {
     RECT rc; GetClientRect(g_hwnd, &rc);
     int w = rc.right, h = rc.bottom;
     if (w <= 0 || h <= 0) return;
-    HDC dc = CreateCompatibleDC(hdc);
-    HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
-    HGDIOBJ ob = SelectObject(dc, bmp);
-    HGDIOBJ of = SelectObject(dc, g_font);
-    FillR(dc, 0, 0, w, h, C_BG);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextAlign(dc, TA_TOP | TA_LEFT);
-    if (g_mdView) MdPaint(dc, w, h); else PaintText(dc, w, h);
-    BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
-    SelectObject(dc, of); SelectObject(dc, ob);
-    DeleteObject(bmp); DeleteDC(dc);
+    if (!g_bb || g_bbW != w || g_bbH != h) {   /* (re)create on resize */
+        if (!g_bb) g_bb = CreateCompatibleDC(hdc);
+        HBITMAP nb = CreateCompatibleBitmap(hdc, w, h);
+        SelectObject(g_bb, nb);
+        if (g_bbBmp) DeleteObject(g_bbBmp);
+        g_bbBmp = nb; g_bbW = w; g_bbH = h; g_dirty = TRUE;
+    }
+    ViewKey k; ViewKeyNow(&k);
+    if (g_dirty || memcmp(&k, &g_vk, sizeof k)) {
+        UpdateMaxW();
+        RenderStrip(0, h);
+        g_vk = k; g_dirty = FALSE;
+    }
+    BitBlt(hdc, pr->left, pr->top, pr->right - pr->left, pr->bottom - pr->top, g_bb, pr->left, pr->top, SRCCOPY);
+}
+/* the view moved by d rows and nothing else changed */
+static unsigned g_scrollPaths;
+static void ScrollView(int d, const ViewKey *k) {
+    g_scrollPaths++;
+    int dy = -d * g_lineH, full = g_ch / g_lineH;
+    int y0 = d > 0 ? (full - d) * g_lineH : 0, y1 = d > 0 ? g_ch : dy;
+    ScrollDC(g_bb, 0, dy, NULL, NULL, NULL, NULL);
+    g_vk = *k;
+    int oldMax = g_maxW;
+    UpdateMaxW();
+    RenderStrip(y0, y1);
+    ScrollWindowEx(g_hwnd, 0, dy, NULL, NULL, NULL, NULL, SW_INVALIDATE);
+    RECT r = { 0, y0, g_cw, y1 }; InvalidateRect(g_hwnd, &r, FALSE);
+    if (g_maxW != oldMax) UpdateScrollBars();
+}
+static void Refresh(BOOL ensure) {
+    if (!g_hwnd) return;
+    if (ensure) EnsureVisible();
+    UpdateScrollBars();
+    ViewKey k; ViewKeyNow(&k);
+    if (g_dirty || !g_bb || g_mdView || g_bbW != g_cw || g_bbH != g_ch) InvalidateRect(g_hwnd, NULL, FALSE);
+    else if (memcmp(&k, &g_vk, sizeof k)) {
+        ViewKey o = g_vk; o.top = k.top; o.topRow = k.topRow;
+        int vis = VisLines();
+        long long d = memcmp(&o, &k, sizeof k) ? vis : RowDelta(g_vk.top, g_vk.topRow, g_top, g_topRow, vis);
+        if (d > -vis && d < vis) ScrollView((int)d, &k);
+        else InvalidateRect(g_hwnd, NULL, FALSE);
+    }
+    PlaceCaret();
 }
 
 /* ================================================================== */
@@ -1356,7 +1715,9 @@ static LRESULT BuildReconvert(RECONVERTSTRING *rs, BOOL docfeed) {
     if (docfeed && g_comp && g_clen > 0) {
         size_t L = LineOf(g_cpos);
         int n = LayoutLine(L, TRUE);
-        tmp = g_lb; slen = (size_t)n; coff = (size_t)g_layCo; clen = (size_t)g_clen; base = LineStart(L);
+        slen = (size_t)n; coff = (size_t)g_ln.co; clen = (size_t)g_clen; base = LineStart(L);
+        tmp = xmalloc((slen + 1) * sizeof(WCHAR)); own = TRUE;
+        LnGet(&g_ln, 0, n, tmp);
     } else {
         BOOL sel = HasSel() && !docfeed;
         size_t a = sel ? SelA() : g_caret, b = sel ? SelB() : g_caret;
@@ -1415,7 +1776,7 @@ static LRESULT OnImeRequest(WPARAM wp, LPARAM lp) {
         if (g_comp && g_clen > 0) {
             L = LineOf(g_cpos); LayoutLine(L, TRUE);
             DWORD k = cp->dwCharPos; if (k > (DWORD)g_clen) k = (DWORD)g_clen;
-            idx = g_layCo + (int)k;
+            idx = g_ln.co + (int)k;
         } else {
             size_t base = HasSel() ? SelA() : g_caret;
             L = LineOf(base);
@@ -1495,7 +1856,7 @@ static void FindCompile(void) {
     }
     free(t);
     SetFindStatus(g_reLiteral ? L"正規表現として無効なため文字列として検索します" : L"");
-    if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+    if (g_hwnd) Invalidate();
 }
 static void SelectMatch(size_t a, size_t b) {
     g_anchor = a; g_caret = b; g_aff = FALSE; g_wantX = -1;
@@ -1829,7 +2190,7 @@ static void FindHide(void) {
     ShowWindow(g_find, SW_HIDE);
     SetFindStatus(L"");
     SetFocus(g_hwnd);
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    Invalidate();
 }
 
 /* ================================================================== */
@@ -2489,7 +2850,7 @@ static void OnKeyDown(WPARAM vk) {
         else {
             POINT pt; size_t L; int r; CaretInfo(&pt, &L, &r);
             LayoutLine(L, FALSE);
-            size_t s = LineStart(L), rs = s + (size_t)g_rows[r];
+            size_t s = LineStart(L), rs = s + (size_t)RowStart(r);
             if (r > 0) { MoveTo(rs, shift, FALSE, FALSE); break; }
             size_t e = LineEnd(L), q = s;      /* smart home: first non-blank, then column 0 */
             while (q < e && (DocAt(q) == L' ' || DocAt(q) == L'\t' || DocAt(q) == 0x3000)) q++;
@@ -2501,7 +2862,7 @@ static void OnKeyDown(WPARAM vk) {
         else {
             POINT pt; size_t L; int r; CaretInfo(&pt, &L, &r);
             LayoutLine(L, FALSE);
-            if (r + 1 < g_nrows) MoveTo(LineStart(L) + (size_t)g_rows[r + 1], shift, FALSE, TRUE);
+            if (HasRow(r + 1)) MoveTo(LineStart(L) + (size_t)RowStart(r + 1), shift, FALSE, TRUE);
             else MoveTo(LineEnd(L), shift, FALSE, FALSE);
         }
         break;
@@ -2566,7 +2927,7 @@ static void OnScroll(int bar, int code) {
         case SB_PAGEUP: StepRows(&g_top, &g_topRow, -v); break;
         case SB_PAGEDOWN: StepRows(&g_top, &g_topRow, v); break;
         case SB_THUMBTRACK: case SB_THUMBPOSITION:
-            if (g_wrap && g_nl <= WRAP_EXACT_LINES) { g_top = 0; g_topRow = 0; StepRows(&g_top, &g_topRow, si.nTrackPos); }
+            if (g_wrap) TopFromRowIndex(si.nTrackPos);
             else { g_top = (size_t)(si.nTrackPos < 0 ? 0 : si.nTrackPos); g_topRow = 0; }
             break;
         case SB_TOP: g_top = 0; g_topRow = 0; break;
@@ -2647,21 +3008,21 @@ static LRESULT CALLBACK TextProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         int oldMax = g_maxW, oldMdH = g_mdH;
-        Paint(dc);
+        Paint(dc, &ps.rcPaint);
         EndPaint(h, &ps);
         if (g_maxW != oldMax || g_mdH != oldMdH) UpdateScrollBars();
         if (g_selftest == 1) { g_selftest = 2; PostMessageW(g_frame, WM_APP + 1, 0, 0); }
         return 0;
     }
     case WM_SETFOCUS:
-        g_focus = TRUE; g_lastFocus = h; CreateCaretNow(); PlaceCaret(); InvalidateRect(h, NULL, FALSE);
+        g_focus = TRUE; g_lastFocus = h; CreateCaretNow(); PlaceCaret(); Invalidate();
         return 0;
     case WM_KILLFOCUS:
         CompleteComposition();              /* EDIT commits the composition on focus loss */
         g_focus = FALSE;
         if (g_caretMade) { DestroyCaret(); g_caretMade = FALSE; }
         if (g_dragging) { g_dragging = FALSE; ReleaseCapture(); }
-        InvalidateRect(h, NULL, FALSE);
+        Invalidate();
         return 0;
     case WM_ENTERMENULOOP:
         CompleteComposition();
@@ -3258,7 +3619,7 @@ static const char *W2U(const WCHAR *w) {   /* UTF-8 for the log (rotating buffer
 static BOOL HasStyle(DWORD st) { return (GetWindowLongW(g_hwnd, GWL_STYLE) & st) != 0; }
 static void SetTextForTest(const WCHAR *t) {
     SetDocText(t, wcslen(t)); ResetDoc(); g_comp = FALSE; ClearComp();
-    UpdateScrollBars(); InvalidateRect(g_hwnd, NULL, FALSE); UpdateWindow(g_hwnd); UpdateScrollBars();
+    UpdateScrollBars(); Invalidate(); UpdateWindow(g_hwnd); UpdateScrollBars();
 }
 static BOOL DocEquals(const WCHAR *t) {
     size_t n = wcslen(t);
@@ -3273,12 +3634,7 @@ static BOOL IndexConsistent(void) {        /* incremental line index vs full rec
         if (DocAt(i) == L'\n') { L++; if (L >= g_nl || LineStart(L) != i + 1) return FALSE; }
     return L + 1 == g_nl;
 }
-static double NowMs(void) {
-    static LARGE_INTEGER f; LARGE_INTEGER c;
-    if (!f.QuadPart) QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
-}
+static double NowMs(void);
 static void SetComp(const WCHAR *comp) {
     BeginComp();
     g_clen = (int)wcslen(comp);
@@ -3296,6 +3652,84 @@ static int MdVisible(const WCHAR *src, WCHAR *vis, WORD *st, int cap) {
     vis[k] = 0;
     free(o.t); free(o.s);
     return k;
+}
+static int LineCopy(size_t L, BOOL comp, WCHAR *t, int cap) {   /* display text of line L */
+    LayoutLine(L, comp);
+    int n = g_ln.n < cap - 1 ? g_ln.n : cap - 1;
+    LnGet(&g_ln, 0, n, t); t[n] = 0;
+    return n;
+}
+static int LineX(size_t L, BOOL comp, int i) { LayoutLine(L, comp); return XOf(&g_ln, i); }
+/* draws t[0, n) of line 0 into a DIB twice: GDI's own layout (no lpDx) and the editor's lpDx; returns differing pixels */
+static int DrawCompare(const WCHAR *t, int n) {
+    LayoutLine(0, FALSE); Win(&g_ln, 0, n);
+    int w = LX(n) + 64, h = g_lineH, diff = 0;
+    BITMAPINFO bi; memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    DWORD *px[2]; HBITMAP bm[2]; HDC dc = CreateCompatibleDC(NULL);
+    int *dx = xmalloc(((size_t)n + 1) * sizeof(int));
+    RunDx(0, n, dx);
+    for (int v = 0; v < 2; v++) {
+        bm[v] = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&px[v], NULL, 0);
+        HGDIOBJ ob = SelectObject(dc, bm[v]), of = SelectObject(dc, g_font);
+        FillR(dc, 0, 0, w, h, C_BG); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, C_TEXT);
+        ExtTextOutW(dc, 8, 0, 0, NULL, t, (UINT)n, v ? dx : NULL);
+        GdiFlush(); SelectObject(dc, of); SelectObject(dc, ob);
+    }
+    for (int k = 0; k < w * h; k++) diff += px[0][k] != px[1][k];
+    DeleteObject(bm[0]); DeleteObject(bm[1]); DeleteDC(dc); free(dx);
+    return diff;
+}
+/* copies the client area (screen = 1) or the back buffer into a malloc'ed 32 bpp pixel array */
+static DWORD *Grab(BOOL screen) {
+    int w = g_cw, h = g_ch;
+    BITMAPINFO bi; memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    DWORD *px; HDC dc = CreateCompatibleDC(NULL);
+    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+    HGDIOBJ ob = SelectObject(dc, bm);
+    HDC src = screen ? GetDC(g_hwnd) : g_bb;
+    BitBlt(dc, 0, 0, w, h, src, 0, 0, SRCCOPY); GdiFlush();
+    if (screen) ReleaseDC(g_hwnd, src);
+    DWORD *out = xmalloc((size_t)w * h * sizeof(DWORD)); memcpy(out, px, (size_t)w * h * sizeof(DWORD));
+    SelectObject(dc, ob); DeleteObject(bm); DeleteDC(dc);
+    return out;
+}
+static int PixDiff(const DWORD *a, const DWORD *b) { int d = 0; for (int k = 0; k < g_cw * g_ch; k++) d += (a[k] & 0xFFFFFF) != (b[k] & 0xFFFFFF); return d; }
+/* composition geometry checks (v1.0.1): underline end, caret, IMR_QUERYCHARPOSITION, candidate rect */
+static void STComp(const char *tag) {
+    char buf[512];
+    SetTextForTest(L"前置き");
+    g_caret = g_anchor = 3;
+    SetComp(L"長井文章をへんかんすると");
+    Refresh(TRUE); UpdateWindow(g_hwnd);
+    WCHAR t[256]; int n = LineCopy(0, TRUE, t, 256), co = g_ln.co;
+    int full = PrefixW(t, n), endx = LineX(0, TRUE, co + g_clen);
+    snprintf(buf, sizeof buf, "%scomposition end x=%d vs reference width=%d (underline ends here)", tag, endx, full);
+    STCheck(abs(endx - full) <= 1, buf);
+    POINT cp; GetCaretPos(&cp);
+    int expect = g_margin + PrefixW(t, co + 2);
+    snprintf(buf, sizeof buf, "%scaret in composition (GCS_CURSORPOS=2): x=%ld expected=%d", tag, cp.x, expect);
+    STCheck(labs(cp.x - expect) <= 1, buf);
+    int maxd = 0;
+    for (int k = 0; k <= g_clen; k++) {
+        IMECHARPOSITION ip; memset(&ip, 0, sizeof ip); ip.dwSize = sizeof ip; ip.dwCharPos = (DWORD)k;
+        OnImeRequest(IMR_QUERYCHARPOSITION, (LPARAM)&ip);
+        POINT p = ip.pt; ScreenToClient(g_hwnd, &p);
+        int e = g_margin + PrefixW(t, co + k);
+        int d = abs(p.x - e); if (d > maxd) maxd = d;
+    }
+    snprintf(buf, sizeof buf, "%sIMR_QUERYCHARPOSITION max diff=%dpx", tag, maxd);
+    STCheck(maxd <= 1, buf);
+    CANDIDATEFORM cf; memset(&cf, 0, sizeof cf);
+    OnImeRequest(IMR_CANDIDATEWINDOW, (LPARAM)&cf);
+    expect = g_margin + PrefixW(t, co);
+    snprintf(buf, sizeof buf, "%scandidate CFS_EXCLUDE rect=(%ld,%ld)-(%ld,%ld), target clause starts at x=%d", tag,
+             cf.rcArea.left, cf.rcArea.top, cf.rcArea.right, cf.rcArea.bottom, expect);
+    STCheck(labs(cf.rcArea.left - expect) <= 1 && labs(cf.rcArea.right - (g_margin + PrefixW(t, co + 2))) <= 1, buf);
+    g_comp = FALSE; ClearComp();
 }
 static void RunSelfTest(void) {
     char buf[512];
@@ -3315,13 +3749,12 @@ static void RunSelfTest(void) {
                                           L"𠮷野家😀と絵文字", L"ｱｲｳ半角ｶﾅ ﾃｽﾄ mixed 全角ＡＢＣ" };
     for (int li = 0; li < 5; li++) {
         SetTextForTest(lines[li]);
-        int n = BuildLine(0, FALSE, NULL); MeasureLine(n);
-        int maxd = 0;
+        WCHAR t[256]; int n = LineCopy(0, FALSE, t, 256), maxd = 0;
         for (int i = 0; i <= n; i++) {
-            if (i < n && IS_LO(g_lb[i])) continue;
-            int d = abs(g_lx[i] - PrefixW(g_lb, i)); if (d > maxd) maxd = d;
+            if (i < n && IS_LO(t[i])) continue;
+            int d = abs(LineX(0, FALSE, i) - PrefixW(t, i)); if (d > maxd) maxd = d;
         }
-        snprintf(buf, sizeof buf, "line %d: MeasureLine vs GetTextExtentPoint32 prefix, max diff=%dpx (width=%d)", li, maxd, g_lx[n]);
+        snprintf(buf, sizeof buf, "line %d: positions (width dictionary) vs GetTextExtentPoint32 prefix, max diff=%dpx (width=%d)", li, maxd, LineX(0, FALSE, n));
         STCheck(maxd <= 1, buf);
     }
     SetTextForTest(L"テスト");
@@ -3334,41 +3767,10 @@ static void RunSelfTest(void) {
     snprintf(buf, sizeof buf, "hit test at x=%d -> pos %u (expected 2)", expect + 1, (unsigned)hp);
     STCheck(hp == 2, buf);
     SetTextForTest(L"a\tb");
-    { int n = BuildLine(0, FALSE, NULL); MeasureLine(n);
-      snprintf(buf, sizeof buf, "tab: x(b)=%d expected=%d", g_lx[2], g_tabW);
-      STCheck(g_lx[2] == g_tabW, buf); }
+    snprintf(buf, sizeof buf, "tab: x(b)=%d expected=%d", LineX(0, FALSE, 2), g_tabW);
+    STCheck(LineX(0, FALSE, 2) == g_tabW, buf);
     /* ---- 2. composition ---- */
-    SetTextForTest(L"前置き");
-    g_caret = g_anchor = 3;
-    SetComp(L"長井文章をへんかんすると");
-    {
-        Refresh(TRUE); UpdateWindow(g_hwnd);
-        int co; int n = BuildLine(0, TRUE, &co); MeasureLine(n);
-        int full = PrefixW(g_lb, n);
-        snprintf(buf, sizeof buf, "composition end x=%d vs reference width=%d (underline ends here)", g_lx[co + g_clen], full);
-        STCheck(abs(g_lx[co + g_clen] - full) <= 1, buf);
-        GetCaretPos(&cp);
-        expect = g_margin + PrefixW(g_lb, co + 2);
-        snprintf(buf, sizeof buf, "caret in composition (GCS_CURSORPOS=2): x=%ld expected=%d", cp.x, expect);
-        STCheck(labs(cp.x - expect) <= 1, buf);
-        int maxd = 0;
-        for (int k = 0; k <= g_clen; k++) {
-            IMECHARPOSITION ip; memset(&ip, 0, sizeof ip); ip.dwSize = sizeof ip; ip.dwCharPos = (DWORD)k;
-            OnImeRequest(IMR_QUERYCHARPOSITION, (LPARAM)&ip);
-            POINT p = ip.pt; ScreenToClient(g_hwnd, &p);
-            int e = g_margin + PrefixW(g_lb, co + k);
-            int d = abs(p.x - e); if (d > maxd) maxd = d;
-        }
-        snprintf(buf, sizeof buf, "IMR_QUERYCHARPOSITION max diff=%dpx", maxd);
-        STCheck(maxd <= 1, buf);
-        CANDIDATEFORM cf; memset(&cf, 0, sizeof cf);
-        OnImeRequest(IMR_CANDIDATEWINDOW, (LPARAM)&cf);
-        expect = g_margin + PrefixW(g_lb, co);
-        snprintf(buf, sizeof buf, "candidate CFS_EXCLUDE rect=(%ld,%ld)-(%ld,%ld), target clause starts at x=%d",
-                 cf.rcArea.left, cf.rcArea.top, cf.rcArea.right, cf.rcArea.bottom, expect);
-        STCheck(labs(cf.rcArea.left - expect) <= 1 && labs(cf.rcArea.right - (g_margin + PrefixW(g_lb, co + 2))) <= 1, buf);
-        g_comp = FALSE; ClearComp();
-    }
+    STComp("");
     /* ---- 3. scrollbars only when needed ---- */
     SetTextForTest(L"1行目\n2行目\n3行目");
     snprintf(buf, sizeof buf, "3 lines: VSCROLL visible=%d HSCROLL visible=%d (expect 0 0)", HasStyle(WS_VSCROLL), HasStyle(WS_HSCROLL));
@@ -3400,8 +3802,8 @@ static void RunSelfTest(void) {
     SetTextForTest(longl);
     {
         LayoutLine(0, FALSE);
-        int W = WrapW(), worst = 0, rows = g_nrows;
-        for (int r = 0; r < g_nrows; r++) { int w = g_lx[RowEnd(r)] - g_lx[g_rows[r]]; if (w > worst) worst = w; }
+        int W = WrapW(), worst = 0, rows = EnsureRows(&g_ln, INT_MAX);
+        for (int r = 0; r < rows; r++) { int w = XOf(&g_ln, RowEnd(r)) - XOf(&g_ln, RowStart(r)); if (w > worst) worst = w; }
         snprintf(buf, sizeof buf, "wrap: 400-char line -> %d rows, widest row %dpx <= wrap width %dpx, HSCROLL=%d (expect 0)", rows, worst, W, HasStyle(WS_HSCROLL));
         STCheck(rows > 1 && worst <= W && !HasStyle(WS_HSCROLL), buf);
         int bad = 0;
@@ -3418,8 +3820,8 @@ static void RunSelfTest(void) {
         OnKeyDown(VK_END);
         POINT pe; CaretPoint(&pe, NULL);
         LayoutLine(0, FALSE);
-        snprintf(buf, sizeof buf, "wrap: End -> pos %u (row 1 starts at %d), caret y=%ld (expect 0)", (unsigned)g_caret, g_rows[1], pe.y);
-        STCheck(g_caret == (size_t)g_rows[1] && pe.y == 0, buf);
+        snprintf(buf, sizeof buf, "wrap: End -> pos %u (row 1 starts at %d), caret y=%ld (expect 0)", (unsigned)g_caret, RowStart(1), pe.y);
+        STCheck(g_caret == (size_t)RowStart(1) && pe.y == 0, buf);
         OnKeyDown(VK_DOWN);
         snprintf(buf, sizeof buf, "wrap: Down moves one visual row (pos %u, row %d)", (unsigned)g_caret, RowOf((int)g_caret));
         LayoutLine(0, FALSE);
@@ -3458,6 +3860,236 @@ static void RunSelfTest(void) {
         double t1 = NowMs();
         snprintf(buf, sizeof buf, "line index: 2000 inserts in the middle of %u lines took %.1f ms, consistent=%d", (unsigned)N, t1 - t0, IndexConsistent());
         STCheck(IndexConsistent() && t1 - t0 < 2000, buf);
+    }
+    /* ---- 5b. piece table: random edits against a plain reference string ---- */
+    {
+        static const WCHAR *const ins[] = { L"a", L"bc", L"\n", L"あい\nう", L"😀", L"\t", L"xyz\n\n", L"漢字かな交じり文" };
+        SetTextForTest(L"初期テキスト\n二行目\n😀end");
+        size_t rn = DocLen(), rcap = 1 << 16, last = 0;
+        WCHAR *ref = xmalloc(rcap * sizeof(WCHAR)), *tmp = xmalloc(rcap * sizeof(WCHAR));
+        DocGet(0, rn, ref);
+        unsigned seed = 4242; int bad = 0;
+        for (int it = 0; it < 6000; it++) {
+            seed = seed * 1103515245u + 12345u;
+            size_t len = DocLen(), p = (seed >> 3) % 4 == 0 ? last : (len ? (seed >> 8) % (len + 1) : 0);
+            if (p > len) p = len;
+            if ((seed >> 5) % 3 == 0 && len > 0) {
+                size_t n = 1 + (seed >> 12) % 9; if (p + n > len) n = len - p;
+                RawDelete(p, n); memmove(ref + p, ref + p + n, (rn - p - n) * sizeof(WCHAR)); rn -= n; last = p;
+            } else {
+                const WCHAR *t = ins[(seed >> 16) % 8]; size_t n = wcslen(t);
+                if (rn + n >= rcap) break;
+                memmove(ref + p + n, ref + p, (rn - p) * sizeof(WCHAR)); memcpy(ref + p, t, n * sizeof(WCHAR)); rn += n;
+                RawInsert(p, t, n); last = p + n;
+            }
+            if (it % 250 == 0 || it == 5999) {
+                DocGet(0, DocLen(), tmp);
+                if (DocLen() != rn || memcmp(tmp, ref, rn * sizeof(WCHAR)) || !IndexConsistent()) bad++;
+                for (int k = 0; k < 50 && rn; k++) { size_t q = (seed + (unsigned)k * 7919u) % rn; if (DocAt(q) != ref[q]) { bad++; break; } }
+            }
+        }
+        size_t pieces = g_npc;
+        snprintf(buf, sizeof buf, "piece table: 6000 random edits vs reference string, mismatches=%d (len=%u pieces=%u lines=%u)", bad, (unsigned)rn, (unsigned)pieces, (unsigned)g_nl);
+        STCheck(bad == 0 && pieces > 1, buf);
+        Compact();
+        DocGet(0, DocLen(), tmp);
+        BOOL ok = g_npc == 1 && DocLen() == rn && !memcmp(tmp, ref, rn * sizeof(WCHAR)) && IndexConsistent();
+        snprintf(buf, sizeof buf, "piece table: consolidation %u pieces -> %u, text and line index unchanged=%d", (unsigned)pieces, (unsigned)g_npc, ok);
+        STCheck(ok, buf);
+        free(ref); free(tmp);
+    }
+    {
+        static const WCHAR *const ins[] = { L"x", L"かな", L"\n", L"😀", L"ab\ncd" };
+        SetTextForTest(L"undo の元テキスト\n2行目\n3行目");
+        size_t n0 = DocLen(); WCHAR *orig = xmalloc((n0 + 1) * sizeof(WCHAR)); DocGet(0, n0, orig); orig[n0] = 0;
+        unsigned seed = 99;
+        for (int it = 0; it < 400; it++) {
+            seed = seed * 1103515245u + 12345u;
+            size_t len = DocLen(), p = len ? (seed >> 8) % (len + 1) : 0;
+            NewGroup();
+            if ((seed >> 4) % 3 == 0 && len) { size_t n = 1 + (seed >> 12) % 4; if (p + n > len) n = len - p; EditDelete(p, n); }
+            else { const WCHAR *t = ins[(seed >> 16) % 5]; EditInsert(p, t, wcslen(t)); }
+        }
+        size_t n1 = DocLen(); WCHAR *fin = xmalloc((n1 + 1) * sizeof(WCHAR)); DocGet(0, n1, fin); fin[n1] = 0;
+        int undos = 0; while (g_undo.n) { Undo(); undos++; }
+        BOOL u = DocEquals(orig) && IndexConsistent();
+        while (g_redo.n) Redo();
+        BOOL rr = DocEquals(fin) && IndexConsistent();
+        snprintf(buf, sizeof buf, "undo/redo: 400 random edits, %d undo steps restore the original=%d, redo restores the result=%d", undos, u, rr);
+        STCheck(u && rr, buf);
+        free(orig); free(fin);
+    }
+    /* ---- 5c. width dictionary == direct measurement, and lpDx drawing == GDI's own glyph placement ---- */
+    {
+        static const WCHAR *const wl[] = { L"abc def_ghi XYZ ;:,.!?()[]{}<>@#$%^&*~|", L"長井文章をへんかんすると下線が長くなります。、「」『』",
+            L"𠮷野家😀と絵文字 ✓★→①", L"ｱｲｳ半角ｶﾅ ﾃｽﾄ mixed 全角ＡＢＣ　x", L"The quick brown fox jumps over the lazy dog 0123456789",
+            L"AVAWATAYToTaFaLTPAVAyWaWe ffi fl Ta.Yo" };
+        int f0 = g_fontIdx; UINT d0 = g_dpi; int worstD = 0, worstPix = 0, combos = 0;
+        char wd[128] = "-", wp[128] = "-";
+        for (int f = 0; f < NFONTS; f++) for (int di = 0; di < 2; di++) {
+            g_fontIdx = f; g_dpi = di ? 144 : 96; SetupFont(); combos++;
+            for (int li = 0; li < 6; li++) {
+                SetDocText(wl[li], wcslen(wl[li])); ResetDoc();
+                WCHAR t[256]; int n = LineCopy(0, FALSE, t, 256), md = 0;
+                for (int i = 0; i <= n; i++) {
+                    if (i < n && IS_LO(t[i])) continue;
+                    int d = abs(LineX(0, FALSE, i) - PrefixW(t, i)); if (d > md) md = d;
+                }
+                int pix = DrawCompare(t, n);
+                if (md > worstD) { worstD = md; snprintf(wd, sizeof wd, "%s %udpi line %d", W2U(kFonts[f]), g_dpi, li); }
+                if (pix > worstPix) { worstPix = pix; snprintf(wp, sizeof wp, "%s %udpi line %d", W2U(kFonts[f]), g_dpi, li); }
+            }
+        }
+        snprintf(buf, sizeof buf, "width dictionary vs GetTextExtentPoint32 of the run: %d fonts x 96/144 dpi x 6 lines, worst diff=%dpx (%s)", NFONTS, worstD, wd);
+        STCheck(worstD == 0, buf);
+        snprintf(buf, sizeof buf, "drawing with measured lpDx vs ExtTextOut's own layout: differing pixels worst=%d (%s)", worstPix, wp);
+        STCheck(worstPix == 0, buf);
+        g_fontIdx = f0; g_dpi = d0; SetupFont();
+        WCHAR *t = xmalloc(20001 * sizeof(WCHAR));
+        for (int i = 0; i < 20000; i++) t[i] = L"あいうえおabcdeカキクケコ漢字 \t。"[i % 20];
+        t[20000] = 0;
+        SetDocText(t, 20000); ResetDoc(); free(t);
+        unsigned c0 = g_gdiCalls; int wfull = LineX(0, FALSE, 20000); unsigned c1 = g_gdiCalls;
+        LayoutReset(); LineX(0, FALSE, 20000); unsigned c2 = g_gdiCalls;
+        snprintf(buf, sizeof buf, "width dictionary: 20000-char line (19 distinct chars) measured with %u GDI calls (fresh dictionary: %u), width=%d",
+                 c1 - c0, c2 - c1, wfull);
+        STCheck(c2 - c1 <= 19, buf);
+    }
+    /* ---- 5d. IME geometry with the font size of 144 DPI (caret drift / long underline history) ---- */
+    { UINT d0 = g_dpi; g_dpi = 144; SetupFont(); STComp("[144dpi font] "); g_dpi = d0; SetupFont(); }
+    /* ---- 5e. caret / hit test on a long line with horizontal scrolling ---- */
+    {
+        WCHAR *t = xmalloc(3001 * sizeof(WCHAR));
+        for (int i = 0; i < 3000; i++) { int k = i % 13; t[i] = k == 3 ? L'\t' : k == 7 ? L'あ' : k == 9 ? L'ｶ' : k == 11 ? L'　' : (WCHAR)(L'a' + i % 26); }
+        t[3000] = 0;
+        SetTextForTest(t); free(t);
+        int bad = 0, badc = 0, maxsx = 0;
+        for (size_t p = 0; p <= 3000; p += 37) {
+            g_caret = g_anchor = p; g_aff = FALSE; Refresh(TRUE); UpdateWindow(g_hwnd);
+            POINT pt, gp; CaretPoint(&pt, NULL); GetCaretPos(&gp);
+            if (gp.x != pt.x || gp.y != pt.y || pt.x < 0 || pt.x > g_cw) badc++;
+            if (PosFromPoint(pt.x, pt.y + g_lineH / 2) != p) bad++;
+            if (g_sx > maxsx) maxsx = g_sx;
+        }
+        snprintf(buf, sizeof buf, "no wrap: caret -> hit test round trip on a 3000-char line, horizontal scroll up to %dpx: mismatches=%d, caret placement errors=%d", maxsx, bad, badc);
+        STCheck(bad == 0 && badc == 0 && maxsx > 1000, buf);
+    }
+    /* ---- 5f. per-line cache: partial measurement + invalidation on edits == fresh layout ---- */
+    {
+        static const WCHAR *const ins[] = { L"x", L"あ", L" ", L"\n", L"。", L"」", L"\t", L"word ", L"長い日本語の文章", L"😀" };
+        g_wrap = TRUE; g_layoutVer++;
+        WCHAR *t = xmalloc(40000 * sizeof(WCHAR)); size_t n = 0;
+        for (int L = 0; L < 60; L++) {
+            int len = (L * 37) % 700;
+            for (int i = 0; i < len; i++) t[n++] = L"日本語の文章、そして English words; 「括弧」。\t"[(i + L) % 29];
+            t[n++] = L'\n';
+        }
+        t[n - 1] = 0;
+        SetTextForTest(t); free(t);
+        unsigned seed = 31337; int bad = 0, checks = 0;
+        for (int it = 0; it < 400; it++) {
+            seed = seed * 1103515245u + 12345u;
+            size_t len = DocLen(), p = len ? (seed >> 8) % (len + 1) : 0;
+            if ((seed >> 4) % 3 == 0 && len) { size_t k = 1 + (seed >> 12) % 6; if (p + k > len) k = len - p; RawDelete(p, k); }
+            else { const WCHAR *s = ins[(seed >> 16) % 10]; RawInsert(p, s, wcslen(s)); }
+            for (int k = 0; k < 3; k++) {
+                seed = seed * 1103515245u + 12345u;
+                Ln ln = LnOf((seed >> 8) % g_nl, FALSE);
+                EnsureRows(&ln, 1 + (int)((seed >> 4) % 6)); XOf(&ln, (int)((seed >> 12) % (unsigned)(ln.n + 1)));
+            }
+            if (it % 25 != 24) continue;
+            for (size_t L = 0; L < g_nl; L++) {
+                Ln ln = LnOf(L, FALSE);
+                int nr = EnsureRows(&ln, INT_MAX), w = XOf(&ln, ln.n), mid = XOf(&ln, ln.n / 3);
+                int *rows = xmalloc(((size_t)nr + 1) * sizeof(int)); memcpy(rows, ln.li->rows, (size_t)nr * sizeof(int));
+                InfoFree(L);
+                Ln f = LnOf(L, FALSE);
+                int fr = EnsureRows(&f, INT_MAX);
+                if (fr != nr || memcmp(rows, f.li->rows, (size_t)nr * sizeof(int)) || XOf(&f, f.n) != w || XOf(&f, f.n / 3) != mid) bad++;
+                checks++; free(rows);
+            }
+        }
+        long long sum = 0; RowCountsCheck();
+        for (size_t L = 0; L < g_nl; L++) sum += RowsOf(L);
+        snprintf(buf, sizeof buf, "line cache: 400 random edits with partial measurement, cached rows/widths vs fresh layout: %d mismatches in %d lines, row sum %lld == %lld",
+                 bad, checks, g_rowsSum, sum);
+        STCheck(bad == 0 && sum == g_rowsSum, buf);
+        g_wrap = FALSE; g_layoutVer++;
+    }
+    /* ---- 5g. scrolling shifts the back buffer and draws only new rows; result == full repaint ---- */
+    {
+        WCHAR *t = xmalloc(200000 * sizeof(WCHAR)); size_t n = 0;
+        for (int L = 0; L < 300; L++) {
+            n += (size_t)swprintf(t + n, 64, L"%03d 行目: ", L);
+            for (int i = 0; i < (L * 53) % 260; i++) t[n++] = L"折り返しの確認 wrap test。\t"[i % 18];
+            t[n++] = L'\n';
+        }
+        t[n - 1] = 0;
+        int dn[2] = { 0, 0 }, ds[2] = { 0, 0 }; unsigned sp0 = g_scrollPaths;
+        for (int wm = 0; wm < 2; wm++) {
+            g_wrap = wm; g_layoutVer++;
+            SetTextForTest(t);
+            g_anchor = LineStart(3) + 2; g_caret = LineStart(12) + 5; g_showWs = TRUE;   /* selection + marks in view */
+            Refresh(FALSE); UpdateWindow(g_hwnd);
+            static const int steps[] = { 3, 5, -2, 1, 7, -4, 2, 2, -1, 9 };
+            for (int k = 0; k < 10; k++) { ScrollRows(steps[k]); UpdateWindow(g_hwnd); }
+            HideCaret(g_hwnd); DWORD *a = Grab(FALSE), *sc = Grab(TRUE); ShowCaret(g_hwnd);
+            Invalidate(); UpdateWindow(g_hwnd);
+            DWORD *b = Grab(FALSE);
+            dn[wm] = PixDiff(a, b); ds[wm] = PixDiff(sc, b);
+            free(a); free(b); free(sc);
+            g_showWs = FALSE;
+        }
+        free(t);
+        snprintf(buf, sizeof buf, "back buffer: %u scroll steps drew only the exposed rows; vs full repaint: differing pixels no-wrap=%d wrap=%d, screen=%d/%d",
+                 g_scrollPaths - sp0, dn[0], dn[1], ds[0], ds[1]);
+        STCheck(g_scrollPaths - sp0 >= 18 && !dn[0] && !dn[1] && !ds[0] && !ds[1], buf);
+        g_wrap = FALSE; g_layoutVer++;
+    }
+    /* ---- 5h. very long line: measured only as far as needed, completed in idle time ---- */
+    {
+        size_t N = 1000000; WCHAR *t = xmalloc((N + 1) * sizeof(WCHAR));
+        for (size_t i = 0; i < N; i++) t[i] = i % 11 == 10 ? L' ' : (i % 5 ? (WCHAR)(L'a' + i % 26) : L'漢');
+        t[N] = 0;
+        double t0 = NowMs(); SetTextForTest(t); double t1 = NowMs();
+        free(t);
+        Ln ln = LnOf(0, FALSE); int mi0 = ln.li->mi;
+        double t2 = NowMs(); OnKeyDown(VK_END); UpdateWindow(g_hwnd); double t3 = NowMs();
+        POINT pt; CaretPoint(&pt, NULL);
+        double t4 = NowMs(); for (int i = 0; i < 20; i++) { OnChar(L'x'); UpdateWindow(g_hwnd); } double t5 = NowMs();
+        ln = LnOf(0, FALSE);
+        snprintf(buf, sizeof buf, "long line: 1M chars, open+paint %.1f ms measured %d units only; End %.1f ms (caret x=%ld); typing at the end %.2f ms/char",
+                 t1 - t0, mi0, t3 - t2, pt.x, (t5 - t4) / 20);
+        STCheck(mi0 < 20000 && pt.x > 0 && pt.x < g_cw && EnsureRows(&ln, INT_MAX) == 1 && (t5 - t4) / 20 < 50, buf);
+        g_caret = g_anchor = 0; Refresh(TRUE); UpdateWindow(g_hwnd);
+        int guard = 0; double t6 = NowMs(); while (IdleWork() && guard < 200000) guard++; double t7 = NowMs();
+        ln = LnOf(0, FALSE);
+        SCROLLINFO si = { sizeof si, SIF_RANGE, 0, 0, 0, 0, 0 }; GetScrollInfo(g_hwnd, SB_HORZ, &si);
+        snprintf(buf, sizeof buf, "long line: idle prefetch completed the width in %.0f ms (%d slices): %d px exact=%d, horizontal range %d == content %d",
+                 t7 - t6, guard, LineWidth(&ln), Measured(&ln), si.nMax + 1, ContentW());
+        STCheck(Measured(&ln) && g_maxW == LineWidth(&ln) && si.nMax + 1 == ContentW(), buf);
+    }
+    /* ---- 5i. wrap: idle row counting makes the vertical scrollbar exact for big documents ---- */
+    {
+        g_wrap = TRUE; g_layoutVer++;
+        size_t n = 0; WCHAR *t = xmalloc(800000 * sizeof(WCHAR));
+        for (int L = 0; L < 3000; L++) {
+            int len = L % 3 == 0 ? 150 + L % 97 : 10 + L % 20;
+            for (int i = 0; i < len; i++) t[n++] = L"あいうえお かきくけこ abc。"[i % 16];
+            t[n++] = L'\n';
+        }
+        t[n - 1] = 0;
+        SetTextForTest(t); free(t);
+        SCROLLINFO s0 = { sizeof s0, SIF_ALL, 0, 0, 0, 0, 0 }; GetScrollInfo(g_hwnd, SB_VERT, &s0);
+        int guard = 0; while (IdleWork() && guard < 200000) guard++;
+        long long sum = 0, above = 0;
+        for (size_t L = 0; L < g_nl; L++) { int r = RowsOf(L); sum += r; if (L < 1500) above += r; }
+        g_top = 1500; g_topRow = 0; Refresh(FALSE); UpdateWindow(g_hwnd);
+        SCROLLINFO s1 = { sizeof s1, SIF_ALL, 0, 0, 0, 0, 0 }; GetScrollInfo(g_hwnd, SB_VERT, &s1);
+        snprintf(buf, sizeof buf, "wrap scrollbar, 3000 lines (> %d): range before idle %d, after idle %d == exact rows %lld; position at line 1500 %d == %lld",
+                 WRAP_EXACT_LINES, s0.nMax + 1, s1.nMax + 1, sum, s1.nPos, above);
+        STCheck(s1.nMax + 1 == sum && s1.nPos == above, buf);
+        g_wrap = FALSE; g_layoutVer++;
     }
     /* ---- 6. Ctrl+I name increment ---- */
     {
@@ -3612,7 +4244,7 @@ static void RunSelfTest(void) {
 /* demo (screenshots) and benchmark modes                              */
 /* ================================================================== */
 static const WCHAR kDemoText[] =
-    L"# CEditor 1.1 デモ\n"
+    L"# CEditor 1.2 デモ\n"
     L"\n"
     L"カスタム描画のテキストエディタです。**太字**、*斜体*、***太字斜体***、~~取り消し線~~、`コード`。\n"
     L"全角スペース「　」と半角スペース「 」とタブ「\t」を含む行。\n"
@@ -3662,74 +4294,122 @@ static void RunDemo(void) {
     Refresh(TRUE);
     if (g_findOpen) SetFocus(g_edFind);
 }
-static void BenchPaint(void) { InvalidateRect(g_hwnd, NULL, FALSE); UpdateWindow(g_hwnd); }
+static void BenchPaint(void) { Invalidate(); UpdateWindow(g_hwnd); }
 static void RunBench(void) {
     FILE *f = _wfopen(g_stlog, L"w");
     if (!f) { MessageBoxW(g_frame, L"ベンチマークのログファイルを開けません。", APPNAME, MB_ICONERROR); }
 #define BLOG(...) do { if (f) { fprintf(f, __VA_ARGS__); fflush(f); } } while (0)
+#define BT(label, n, code) do { double t0_ = NowMs(); for (int i_ = 0; i_ < (n); i_++) { code; } double t1_ = NowMs(); \
+        BLOG("%-44s %9.2f ms total %8.3f ms each\n", label, t1_ - t0_, (t1_ - t0_) / (n)); } while (0)
+    PROCESS_MEMORY_COUNTERS pm0; memset(&pm0, 0, sizeof pm0); GetProcessMemoryInfo(GetCurrentProcess(), &pm0, sizeof pm0);
+    BLOG("%s bench\n", W2U(APPNAME L" " APPVER));
     double t0 = NowMs();
     g_loadQuiet = TRUE;
     BOOL ok = LoadFile(g_benchFile);
     double t1 = NowMs();
+    PROCESS_MEMORY_COUNTERS pm1; memset(&pm1, 0, sizeof pm1); GetProcessMemoryInfo(GetCurrentProcess(), &pm1, sizeof pm1);
     BLOG("file: %s\nload: %s, %.0f ms, %u chars, %u lines\n", W2U(g_benchFile), ok ? "ok" : "FAILED", t1 - t0, (unsigned)DocLen(), (unsigned)g_nl);
-    t0 = NowMs(); BenchPaint(); t1 = NowMs();
-    BLOG("first paint: %.1f ms\n", t1 - t0);
-    t0 = NowMs();
-    for (int i = 0; i < 100; i++) { OnKeyDown(VK_NEXT); UpdateWindow(g_hwnd); }
-    t1 = NowMs();
-    BLOG("100 x PageDown (caret + scroll + paint): %.1f ms total, %.2f ms each\n", t1 - t0, (t1 - t0) / 100);
-    t0 = NowMs();
-    for (int i = 0; i < 300; i++) { ScrollRows(3); UpdateWindow(g_hwnd); }
-    t1 = NowMs();
-    BLOG("300 x wheel scroll (3 lines): %.2f ms each\n", (t1 - t0) / 300);
-    t0 = NowMs();
-    g_caret = g_anchor = LineStart(g_nl / 2); Refresh(TRUE); UpdateWindow(g_hwnd);
-    t1 = NowMs();
-    BLOG("jump to middle line %u: %.1f ms\n", (unsigned)(g_nl / 2), t1 - t0);
-    t0 = NowMs();
-    for (int i = 0; i < 200; i++) { OnChar(L'x'); UpdateWindow(g_hwnd); }
-    for (int i = 0; i < 20; i++) { OnChar(L'\r'); UpdateWindow(g_hwnd); }
-    t1 = NowMs();
-    BLOG("220 typed chars in the middle (incl. 20 newlines): %.2f ms each, index consistent: %s\n", (t1 - t0) / 220,
-         DocLen() < 4000000 ? (IndexConsistent() ? "yes" : "NO") : "(skipped: large)");
-    t0 = NowMs();
-    OnKeyDown(VK_END); g_caret = g_anchor = DocLen(); Refresh(TRUE); UpdateWindow(g_hwnd);
-    t1 = NowMs();
-    BLOG("Ctrl+End: %.1f ms\n", t1 - t0);
-    t0 = NowMs();
-    for (int i = 0; i < 20; i++) { Undo(); }
-    Refresh(TRUE); UpdateWindow(g_hwnd);
-    t1 = NowMs();
-    BLOG("20 undo: %.1f ms\n", t1 - t0);
+    BLOG("memory after load: working set %.1f MB, peak %.1f MB (before load %.1f MB)\n", pm1.WorkingSetSize / 1048576.0, pm1.PeakWorkingSetSize / 1048576.0, pm0.WorkingSetSize / 1048576.0);
+    BT("first paint", 1, BenchPaint());
+    BT("no-wrap: PageDown (caret+scroll+paint)", 100, (OnKeyDown(VK_NEXT), UpdateWindow(g_hwnd)));
+    BT("no-wrap: wheel scroll 3 rows", 300, (ScrollRows(3), UpdateWindow(g_hwnd)));
+    BT("no-wrap: wheel scroll 1 row up", 100, (ScrollRows(-1), UpdateWindow(g_hwnd)));
+    BT("no-wrap: scroll right (SB_LINERIGHT)", 100, (OnScroll(SB_HORZ, SB_LINERIGHT), UpdateWindow(g_hwnd)));
+    BT("no-wrap: scroll back to the left edge", 1, (OnScroll(SB_HORZ, SB_LEFT), UpdateWindow(g_hwnd)));
+    size_t mid = DocLen() / 2; if (mid && IS_LO(DocAt(mid))) mid--;
+    BT("jump to the middle character", 1, (g_caret = g_anchor = mid, Refresh(TRUE), UpdateWindow(g_hwnd)));
+    BT("typing in the middle (200 chars)", 200, (OnChar(L'x'), UpdateWindow(g_hwnd)));
+    BT("typing in the middle (20 newlines)", 20, (OnChar(L'\r'), UpdateWindow(g_hwnd)));
+    BT("End (end of the line) + paint", 1, (OnKeyDown(VK_END), UpdateWindow(g_hwnd)));
+    BT("typing at the line end (50 chars)", 50, (OnChar(L'y'), UpdateWindow(g_hwnd)));
+    BT("Home + paint", 1, (OnKeyDown(VK_HOME), UpdateWindow(g_hwnd)));
+    BT("Ctrl+End", 1, (g_caret = g_anchor = DocLen(), Refresh(TRUE), UpdateWindow(g_hwnd)));
+    BT("20 undo (+ one paint)", 1, { for (int k = 0; k < 20; k++) Undo(); Refresh(TRUE); UpdateWindow(g_hwnd); });
     g_wrap = TRUE; g_layoutVer++; g_caret = g_anchor = 0; g_top = 0; g_topRow = 0;
-    t0 = NowMs(); Refresh(TRUE); UpdateWindow(g_hwnd); t1 = NowMs();
-    BLOG("wrap on: %.1f ms\n", t1 - t0);
-    t0 = NowMs();
-    for (int i = 0; i < 100; i++) { OnKeyDown(VK_NEXT); UpdateWindow(g_hwnd); }
-    t1 = NowMs();
-    BLOG("wrap: 100 x PageDown: %.2f ms each\n", (t1 - t0) / 100);
-    g_wrap = FALSE; g_layoutVer++;
-    t0 = NowMs();
+    BT("wrap on (top of file)", 1, (Refresh(TRUE), UpdateWindow(g_hwnd)));
+    BT("wrap: PageDown", 100, (OnKeyDown(VK_NEXT), UpdateWindow(g_hwnd)));
+    BT("wrap: wheel scroll 3 rows", 300, (ScrollRows(3), UpdateWindow(g_hwnd)));
+    BT("wrap: wheel scroll 1 row up", 100, (ScrollRows(-1), UpdateWindow(g_hwnd)));
+    BT("wrap: jump to the middle + typing 20 chars", 1, { g_caret = g_anchor = mid; Refresh(TRUE); UpdateWindow(g_hwnd); for (int k = 0; k < 20; k++) { OnChar(L'z'); UpdateWindow(g_hwnd); } });
+    BT("wrap: Ctrl+End", 1, (g_caret = g_anchor = DocLen(), Refresh(TRUE), UpdateWindow(g_hwnd)));
+    g_wrap = FALSE; g_layoutVer++; g_caret = g_anchor = 0; Refresh(TRUE); UpdateWindow(g_hwnd);
     {
         int ep; Regex *re = re_compile((const rechar *)L"ZQX_NOT_PRESENT\\d", 17, RE_ICASE, &ep);
-        Regex *sv = g_re; g_re = re;
-        size_t a, b; BOOL found = FindFrom(0, TRUE, &a, &b);
+        Regex *sv = g_re; g_re = re; size_t a, b; BOOL found = FALSE;
+        BT("full-document regex search (no match)", 1, found = FindFrom(0, TRUE, &a, &b));
         g_re = sv; re_free(re);
-        t1 = NowMs();
-        BLOG("full-document regex search (no match): %s, %.0f ms\n", found ? "found?!" : "not found", t1 - t0);
+        if (found) BLOG("  (unexpected match)\n");
     }
-    double tsv0 = NowMs();
     WCHAR tmp[MAX_PATH], sp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp); _snwprintf(sp, MAX_PATH, L"%lsced_bench_save.txt", tmp); sp[MAX_PATH - 1] = 0;
     WCHAR keep[MAX_PATH * 4]; wcscpy(keep, g_path);
-    BOOL sok = SaveFile(sp);
-    double tsv1 = NowMs();
-    BLOG("save (UTF-8): %s, %.0f ms\n", sok ? "ok" : "FAILED", tsv1 - tsv0);
+    BOOL sok = FALSE;
+    BT("save (UTF-8)", 1, sok = SaveFile(sp));
+    if (!sok) BLOG("  save FAILED\n");
     DeleteFileW(sp); wcscpy(g_path, keep);
+    PROCESS_MEMORY_COUNTERS pm2; memset(&pm2, 0, sizeof pm2); GetProcessMemoryInfo(GetCurrentProcess(), &pm2, sizeof pm2);
+    BLOG("memory at the end: working set %.1f MB, peak working set %.1f MB, private %.1f MB\n", pm2.WorkingSetSize / 1048576.0, pm2.PeakWorkingSetSize / 1048576.0, pm2.PagefileUsage / 1048576.0);
     BLOG("done\n");
+#undef BT
 #undef BLOG
     if (f) fclose(f);
     g_modified = FALSE;
     PostMessageW(g_frame, WM_CLOSE, 0, 0);
+}
+
+/* ================================================================== */
+/* idle time (message loop has nothing to do): measure / wrap the lines */
+/* around the viewport, count wrapped rows of the whole document       */
+/* ================================================================== */
+#define INFO_MAX 20000                      /* cached line infos kept (far ones are dropped) */
+static double NowMs(void) {
+    static LARGE_INTEGER f; LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+static LineInfo g_bgi; static size_t g_bgiL = (size_t)-1; static unsigned g_bgiDV;
+static BOOL IdleBusy(double t0) { return NowMs() - t0 > 4.0 || HIWORD(GetQueueStatus(QS_ALLINPUT)); }
+/* does a few ms of work; returns TRUE if there is more */
+static BOOL IdleWork(void) {
+    static double lastSB;
+    if (!g_hwnd || g_mdView || IsIconic(g_frame)) return FALSE;
+    double t0 = NowMs();
+    int vis = VisLines(), W = g_wrap ? WrapW() : 0;
+    size_t lo = g_top > (size_t)vis * 3 ? g_top - (size_t)vis * 3 : 0, hi = g_top + (size_t)vis * 4;
+    BOOL busy = FALSE, visible = FALSE;
+    long long sum0 = g_rowsSum;
+    RowCountsCheck();
+    /* 1) the viewport, then three screens below and three above */
+    for (int pass = 0; pass < 3 && !busy; pass++) {
+        size_t a = pass == 0 ? g_top : pass == 1 ? g_top + (size_t)vis + 1 : lo;
+        size_t b = pass == 0 ? g_top + (size_t)vis + 1 : pass == 1 ? hi : g_top;
+        for (size_t L = a; L < b && L < g_nl && !busy; L++) {
+            Ln ln = LnOf(L, TRUE);
+            while (!busy && !(g_wrap ? ln.li->rw == W && ln.li->rdone : Measured(&ln))) {
+                if (g_wrap) EnsureRows(&ln, (ln.li->rw == W ? ln.li->nr : 0) + 64);
+                else Measure(&ln, ln.li->mi + 65536);
+                visible |= pass == 0; busy = IdleBusy(t0);
+            }
+        }
+    }
+    /* 2) wrap: row count of every line, so the vertical scrollbar becomes exact */
+    while (g_wrap && !busy && g_bgL < g_nl) {
+        if (g_lm[g_bgL].rows) { g_bgL++; continue; }
+        if (g_bgiL != g_bgL || g_bgiDV != g_docVer) { InfoReset(&g_bgi); g_bgiL = g_bgL; g_bgiDV = g_docVer; }
+        Ln ln = { g_bgL, -1, (int)(LineEnd(g_bgL) - LineStart(g_bgL)), g_lm[g_bgL].li ? g_lm[g_bgL].li : &g_bgi };
+        EnsureRows(&ln, (ln.li->rw == W ? ln.li->nr : 0) + 256);
+        if (ln.li->rdone && !g_lm[g_bgL].rows) SetRowCount(g_bgL, ln.li->nr);
+        busy = IdleBusy(t0);
+    }
+    /* 3) bound the memory of the line cache */
+    if (g_ninfo > INFO_MAX) {
+        size_t a = g_top > INFO_MAX / 4 ? g_top - INFO_MAX / 4 : 0, b = g_top + INFO_MAX / 4;
+        for (size_t L = 0; L < g_nl; L++) if (g_lm[L].li && (L < a || L > b) && L != g_ln.L) InfoFree(L);
+    }
+    int om = g_maxW;
+    if (visible) UpdateMaxW();
+    if (om != g_maxW || (g_rowsSum != sum0 && (NowMs() - lastSB > 150 || !busy))) { UpdateScrollBars(); lastSB = NowMs(); }
+    return busy;
 }
 
 /* ================================================================== */
@@ -3785,6 +4465,11 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdl, int show) {
     if (file && !g_selftest) { LoadFile(file); Refresh(FALSE); }
     if (argv) LocalFree(argv);
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    for (;;) {                              /* input first; layout work only when the queue is empty */
+        if (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) break;
+            TranslateMessage(&msg); DispatchMessageW(&msg);
+        } else if (!IdleWork()) WaitMessage();
+    }
     return (int)msg.wParam;
 }
