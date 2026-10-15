@@ -1,5 +1,5 @@
 /*
- * CEditor 1.2 - custom-drawn Win32 text editor with EDIT-compatible inline Japanese IME,
+ * CEditor 1.3 - custom-drawn Win32 text editor with EDIT-compatible inline Japanese IME,
  * custom title bar, find/replace (own regex engine), word wrap, large files, Markdown view.
  * Plain C / Win32 / GDI / IMM32 / DWM. No EDIT/RichEdit for the document itself.
  */
@@ -31,7 +31,7 @@
 #include "regex.h"
 
 #define APPNAME   L"CEditor"
-#define APPVER    L"1.2.0"
+#define APPVER    L"1.3.0"
 #define CLS_FRAME L"CEditorFrame"
 #define CLS_TEXT  L"CEditorText"
 #define CLS_FIND  L"CEditorFind"
@@ -82,9 +82,10 @@ static const WCHAR *const kFonts[] = { L"MS Gothic", L"BIZ UDGothic", L"Meiryo",
 static const WCHAR *const kFontLabels[] = { L"MS ゴシック (等幅)", L"BIZ UDゴシック (等幅)", L"メイリオ", L"Yu Gothic UI", L"Consolas" };
 #define NFONTS ((int)(sizeof(kFonts) / sizeof(kFonts[0])))
 
+static void NoMem(void) { MessageBoxW(NULL, L"メモリ不足です。", APPNAME, MB_ICONERROR); ExitProcess(1); }
 static void *xrealloc(void *p, size_t n) {
     void *q = realloc(p, n ? n : 1);
-    if (!q) { MessageBoxW(NULL, L"メモリ不足です。", APPNAME, MB_ICONERROR); ExitProcess(1); }
+    if (!q) NoMem();
     return q;
 }
 static void *xmalloc(size_t n) { return xrealloc(NULL, n); }
@@ -96,19 +97,32 @@ static void *xmalloc(size_t n) { return xrealloc(NULL, n); }
 /* ================================================================== */
 /* The loaded text (g_org) is never modified. Inserted text is appended to add blocks (append-only,
    never moved), and the document is the concatenation of the pieces in g_pc. Deleting only edits the
-   piece list. Typing extends the last piece in place, so it does not create new pieces. */
+   piece list. Typing extends the last piece in place, so it does not create new pieces.
+   In idle time, runs of small pieces are copied into line-aligned contiguous chunks (a very long line
+   is stored as several chunks), so that nearly every line is one contiguous range that search and save
+   read in place. Afterwards memory that no piece refers to any more is given back (see Compaction). */
 typedef struct { const WCHAR *p; size_t pos, len; } Piece;   /* pos = document offset of the piece */
-static WCHAR *g_org;                        /* original text (immutable) */
-static WCHAR **g_blk; static size_t g_nblk; /* all add blocks (freed on compaction) */
+static WCHAR *g_org; static size_t g_orgCap;   /* original text (immutable, VirtualAlloc'ed, g_orgCap + 1 units) */
+typedef struct { WCHAR *p; size_t cap; } Block;
+static Block *g_blk; static size_t g_nblk;  /* all add blocks */
 static WCHAR *g_add; static size_t g_addN, g_addCap;   /* current add block */
 static Piece *g_pc; static size_t g_npc, g_pccap, g_pcHint;
 static size_t g_len;
-#define PIECES_COMPACT 50000                /* piece count that triggers consolidation */
+#define PIECES_COMPACT 50000                /* piece count that makes an edit run compaction at once */
+static size_t g_cpk, g_syncAt = PIECES_COMPACT; /* compaction cursor (piece index) */
+static BOOL g_cdone = TRUE, g_cclean, g_gcDue;  /* compaction finished / no work in this pass / release due */
 static size_t *g_ls; static size_t g_nl, g_lscap;
 /* lazy shift: entries with index >= g_dIdx must be adjusted by g_delta (typing = O(1)) */
 static size_t g_dIdx = (size_t)-1; static ptrdiff_t g_delta;
 static unsigned g_docVer = 1;
 
+/* original-text buffer: committed on demand, so untouched pages cost no RAM; parts can be released */
+static WCHAR *OrgAlloc(size_t n) { return VirtualAlloc(NULL, (n + 1) * sizeof(WCHAR), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }
+static void OrgFree(WCHAR *p) { if (p) VirtualFree(p, 0, MEM_RELEASE); }
+static void Decommit(const WCHAR *a, const WCHAR *b) {   /* gives the whole pages inside [a, b) back */
+    uintptr_t s = ((uintptr_t)a + 4095) & ~(uintptr_t)4095, e = (uintptr_t)b & ~(uintptr_t)4095;
+    if (e > s) VirtualFree((void *)s, e - s, MEM_DECOMMIT);
+}
 static size_t DocLen(void) { return g_len; }
 static size_t PieceAt(size_t i) {           /* piece containing offset i (< g_len); sequential access is O(1) */
     size_t k = g_pcHint;
@@ -125,6 +139,12 @@ static void DocGet(size_t p, size_t n, WCHAR *d) {
         memcpy(d, g_pc[k].p + o, a * sizeof(WCHAR)); d += a; p += a; n -= a;
     }
 }
+/* [p, p + n) in place if it lies inside one piece, else NULL */
+static const WCHAR *DocPtr(size_t p, size_t n) {
+    if (!n || p >= g_len) return NULL;
+    const Piece *c = &g_pc[PieceAt(p)];
+    return p + n <= c->pos + c->len ? c->p + (p - c->pos) : NULL;
+}
 static void PcInsert(size_t k, Piece pc) {
     if (g_npc == g_pccap) { g_pccap = g_pccap * 2 + 16; g_pc = xrealloc(g_pc, g_pccap * sizeof(Piece)); }
     memmove(g_pc + k + 1, g_pc + k, (g_npc - k) * sizeof(Piece));
@@ -140,41 +160,37 @@ static size_t SplitAt(size_t p) {           /* makes p a piece boundary; returns
     PcInsert(k + 1, r);
     return k + 1;
 }
-static const WCHAR *AddText(const WCHAR *s, size_t n) {
+static WCHAR *AddAlloc(size_t n) {
     if (g_addCap - g_addN < n) {
         g_addCap = n > (1u << 20) ? n : (1u << 20); g_addN = 0;
         g_add = xmalloc(g_addCap * sizeof(WCHAR));
-        g_blk = xrealloc(g_blk, (g_nblk + 1) * sizeof *g_blk); g_blk[g_nblk++] = g_add;
+        g_blk = xrealloc(g_blk, (g_nblk + 1) * sizeof *g_blk); g_blk[g_nblk].p = g_add; g_blk[g_nblk++].cap = g_addCap;
     }
-    WCHAR *d = g_add + g_addN; memcpy(d, s, n * sizeof(WCHAR)); g_addN += n;
+    WCHAR *d = g_add + g_addN; g_addN += n;
     return d;
 }
 static void PtInsert(size_t p, const WCHAR *s, size_t n) {
-    const WCHAR *t = AddText(s, n);
+    WCHAR *t = AddAlloc(n); memcpy(t, s, n * sizeof(WCHAR));
     size_t k = SplitAt(p);
     if (k > 0 && t > g_add && g_pc[k - 1].p + g_pc[k - 1].len == t) g_pc[k - 1].len += n;   /* typing */
     else { Piece pc = { t, p, n }; PcInsert(k++, pc); }
     PcShift(k, (ptrdiff_t)n); g_len += n;
+    g_cdone = g_cclean = FALSE;
 }
 static void PtDelete(size_t p, size_t n) {
     size_t a = SplitAt(p), b = SplitAt(p + n);
     memmove(g_pc + a, g_pc + b, (g_npc - b) * sizeof(Piece)); g_npc -= b - a;
     PcShift(a, -(ptrdiff_t)n); g_len -= n;
+    g_cdone = g_cclean = FALSE;
 }
-/* t (n units, malloc'ed) becomes the whole document as one piece; old buffers are freed */
-static void PtAdopt(WCHAR *t, size_t n) {
-    if (g_org != t) free(g_org);
-    for (size_t i = 0; i < g_nblk; i++) free(g_blk[i]);
+/* t (n units, from OrgAlloc(cap)) becomes the whole document as one piece; old buffers are freed */
+static void PtAdopt(WCHAR *t, size_t n, size_t cap) {
+    if (g_org != t) OrgFree(g_org);
+    for (size_t i = 0; i < g_nblk; i++) free(g_blk[i].p);
     free(g_blk); g_blk = NULL; g_nblk = 0; g_add = NULL; g_addN = g_addCap = 0;
-    g_org = t; g_len = n; g_npc = 0; g_pcHint = 0;
+    g_org = t; g_orgCap = cap; g_len = n; g_npc = 0; g_pcHint = 0;
+    g_cpk = 0; g_cdone = TRUE; g_gcDue = FALSE; g_syncAt = PIECES_COMPACT;
     if (n) { Piece pc = { t, 0, n }; PcInsert(0, pc); }
-}
-/* consolidate all pieces into one buffer (on save, or when there are very many pieces) */
-static void Compact(void) {
-    if (g_npc <= 1 && !g_nblk) return;
-    WCHAR *t = xmalloc((g_len + 1) * sizeof(WCHAR));
-    DocGet(0, g_len, t);
-    PtAdopt(t, g_len);
 }
 
 /* ---- per-line metadata (kept parallel to the line index) ---- */
@@ -187,8 +203,10 @@ typedef struct {                            /* measurement progress of one displ
     int *rows; int nr, cr, rw;              /* wrap row starts found so far (rows[0] = 0) for wrap width rw */
     BOOL rdone;                             /* all rows found */
 } LineInfo;
-typedef struct { LineInfo *li; int rows; } LineMeta;   /* rows: wrapped row count, 0 = not known yet */
+typedef struct { unsigned li; int rows; } LineMeta;   /* li: index into g_info (0 = none); rows: wrapped rows, 0 = not known */
 static LineMeta *g_lm;
+static LineInfo **g_info; static unsigned *g_ifree; static size_t g_infoCap, g_infoTop, g_nifree;   /* pool */
+#define LI(L) (g_lm[L].li ? g_info[g_lm[L].li] : NULL)
 static unsigned g_infoSeq; static size_t g_ninfo;
 static long long g_rowsSum;                 /* wrap: sum over lines of (rows known ? rows : 1) */
 static int g_rowsW = -1;                    /* wrap width the known row counts belong to */
@@ -200,9 +218,23 @@ static void InfoReset(LineInfo *li) {
     if (!li->cck) { li->cck = 16; li->ck = xmalloc(16 * sizeof(Mark)); }
     li->ck[0].i = li->ck[0].x = 0; li->nck = 1;
 }
+static unsigned InfoNew(void) {
+    unsigned i;
+    if (g_nifree) i = g_ifree[--g_nifree];
+    else {
+        if (g_infoTop + 1 >= g_infoCap) {
+            g_infoCap = g_infoCap * 2 + 64;
+            g_info = xrealloc(g_info, g_infoCap * sizeof *g_info); g_ifree = xrealloc(g_ifree, g_infoCap * sizeof *g_ifree);
+        }
+        i = (unsigned)++g_infoTop;
+    }
+    LineInfo *li = calloc(1, sizeof(LineInfo)); if (!li) NoMem();
+    InfoReset(li); g_info[i] = li; g_ninfo++;
+    return i;
+}
 static void InfoFree(size_t L) {
-    LineInfo *li = g_lm[L].li;
-    if (li) { free(li->ck); free(li->rows); free(li); g_lm[L].li = NULL; g_ninfo--; }
+    LineInfo *li = LI(L);
+    if (li) { free(li->ck); free(li->rows); free(li); g_ifree[g_nifree++] = g_lm[L].li; g_lm[L].li = 0; g_ninfo--; }
 }
 static int RowsK(size_t L) { return g_lm[L].rows ? g_lm[L].rows : 1; }
 static void SetRowCount(size_t L, int n) {
@@ -214,7 +246,7 @@ static void SetRowCount(size_t L, int n) {
 /* text of line L changed from offset off on: keep what was measured safely before it */
 static void LineEdited(size_t L, size_t off) {
     SetRowCount(L, 0);
-    LineInfo *li = g_lm[L].li;
+    LineInfo *li = LI(L);
     if (!li) return;
     int keep = off > 64 ? (int)off - 64 : 0;  /* clusters and break rules look a little around a position */
     li->id = ++g_infoSeq;
@@ -227,17 +259,18 @@ static void LineEdited(size_t L, size_t off) {
 }
 
 static size_t LS(size_t j) { return j >= g_dIdx ? (size_t)((ptrdiff_t)g_ls[j] + g_delta) : g_ls[j]; }
-static void FlushDelta(void) {
-    if (g_dIdx != (size_t)-1) {
-        for (size_t j = g_dIdx; j < g_nl; j++) g_ls[j] = (size_t)((ptrdiff_t)g_ls[j] + g_delta);
-        g_dIdx = (size_t)-1; g_delta = 0;
-    }
-}
+/* entries from 'from' on move by d: only the entries between the old and the new lazy start are touched */
 static void ShiftFrom(size_t from, ptrdiff_t d) {
     if (from >= g_nl || d == 0) return;
-    if (g_dIdx == from) { g_delta += d; return; }
-    FlushDelta();
-    g_dIdx = from; g_delta = d;
+    if (g_dIdx == (size_t)-1) { g_dIdx = from; g_delta = d; return; }
+    if (from < g_dIdx) for (size_t j = from; j < g_dIdx && j < g_nl; j++) g_ls[j] = (size_t)((ptrdiff_t)g_ls[j] - g_delta);
+    else for (size_t j = g_dIdx; j < from; j++) g_ls[j] = (size_t)((ptrdiff_t)g_ls[j] + g_delta);
+    g_dIdx = from; g_delta += d;
+}
+static void ExactBelow(size_t j0) {         /* entries below j0 hold exact values (lazy range starts at j0 or later) */
+    if (g_dIdx == (size_t)-1 || g_dIdx >= j0) return;
+    for (size_t j = g_dIdx; j < j0 && j < g_nl; j++) g_ls[j] = (size_t)((ptrdiff_t)g_ls[j] + g_delta);
+    g_dIdx = j0;
 }
 static void LsReserve(size_t n) {
     if (n <= g_lscap) return;
@@ -271,6 +304,7 @@ static size_t LineOf(size_t pos) {
 static size_t LineStart(size_t L) { return LS(L); }
 static size_t LineEnd(size_t L) { return L + 1 < g_nl ? LS(L + 1) - 1 : DocLen(); }
 
+static void CompactNow(void);
 static void RawInsert(size_t p, const WCHAR *s, size_t n) {
     if (!n) return;
     size_t L = LineOf(p), k = 0;
@@ -279,17 +313,18 @@ static void RawInsert(size_t p, const WCHAR *s, size_t n) {
     PtInsert(p, s, n);
     if (k == 0) ShiftFrom(L + 1, (ptrdiff_t)n);
     else {
-        FlushDelta();
+        ExactBelow(L + 1);
         LsReserve(g_nl + k);
         memmove(g_ls + L + 1 + k, g_ls + L + 1, (g_nl - L - 1) * sizeof(size_t));
+        if (g_dIdx != (size_t)-1) g_dIdx += k;
         memmove(g_lm + L + 1 + k, g_lm + L + 1, (g_nl - L - 1) * sizeof(LineMeta));
         memset(g_lm + L + 1, 0, k * sizeof(LineMeta));
-        for (size_t j = L + 1 + k; j < g_nl + k; j++) g_ls[j] += n;
         size_t w = L + 1;
         for (size_t i = 0; i < n; i++) if (s[i] == L'\n') g_ls[w++] = p + i + 1;
         g_nl += k; g_rowsSum += (long long)k; g_tcL = 0; g_tcS = 0;
+        ShiftFrom(L + 1 + k, (ptrdiff_t)n);
     }
-    if (g_npc > PIECES_COMPACT) Compact();
+    if (g_npc > g_syncAt) CompactNow();
     g_docVer++;
 }
 static void RawDelete(size_t p, size_t n) {
@@ -300,18 +335,92 @@ static void RawDelete(size_t p, size_t n) {
     size_t k = Le - L;
     if (k == 0) ShiftFrom(L + 1, -(ptrdiff_t)n);
     else {
-        FlushDelta();
+        ExactBelow(L + 1);
         for (size_t j = L + 1; j <= Le; j++) { g_rowsSum -= RowsK(j); InfoFree(j); }
         memmove(g_ls + L + 1, g_ls + Le + 1, (g_nl - Le - 1) * sizeof(size_t));
+        if (g_dIdx != (size_t)-1) g_dIdx = g_dIdx > Le ? g_dIdx - k : L + 1;
         memmove(g_lm + L + 1, g_lm + Le + 1, (g_nl - Le - 1) * sizeof(LineMeta));
         g_nl -= k;
-        for (size_t j = L + 1; j < g_nl; j++) g_ls[j] -= n;
+        ShiftFrom(L + 1, -(ptrdiff_t)n);
         g_tcL = 0; g_tcS = 0;
     }
     if (g_bgL > g_nl) g_bgL = g_nl;
-    if (g_npc > PIECES_COMPACT) Compact();
+    if (g_npc > g_syncAt) CompactNow();
     g_docVer++;
 }
+/* ---- compaction (idle time) ----
+   Copies runs of small pieces into new contiguous pieces that start and end at line boundaries; inside
+   a very long line the pieces are cut into chunks of a few thousand units instead. The text does not
+   change, so undo records (positions + text), the line index and the layout caches stay valid. */
+#define CHUNK 16384                         /* merged pieces grow up to about this size (units) */
+#define SMALL 2048                          /* pieces shorter than this are merged */
+static BOOL AtLineStart(size_t p) { return p == 0 || DocAt(p - 1) == L'\n'; }
+static BOOL AtLineEnd(size_t e) { return e >= g_len || DocAt(e - 1) == L'\n'; }
+static BOOL PieceGood(size_t k) {
+    const Piece *c = &g_pc[k];
+    if (c->len >= SMALL) return TRUE;
+    if (!AtLineStart(c->pos) || !AtLineEnd(c->pos + c->len)) return FALSE;
+    return !(k + 1 < g_npc && g_pc[k + 1].len < SMALL && c->len + g_pc[k + 1].len <= CHUNK);
+}
+static size_t Materialize(size_t a, size_t b) {   /* document [a, b) becomes one new piece; returns its index */
+    WCHAR *t = AddAlloc(b - a); DocGet(a, b - a, t);
+    size_t i = SplitAt(a), j = SplitAt(b);
+    Piece pc = { t, a, b - a };
+    memmove(g_pc + i + 1, g_pc + j, (g_npc - j) * sizeof(Piece)); g_npc -= j - i - 1;
+    g_pc[i] = pc; g_pcHint = i;
+    return i;
+}
+static size_t CompactAt(size_t k) {         /* piece k is not good: merge it with its surroundings */
+    size_t p = g_pc[k].pos, e = p + g_pc[k].len, a = p, b = e;
+    if (AtLineStart(p) && AtLineEnd(e)) b = e + g_pc[k + 1].len;          /* two small whole-line pieces */
+    else {
+        size_t ls = LineStart(LineOf(p)), L2 = LineOf(e - 1), le = L2 + 1 < g_nl ? LineStart(L2 + 1) : g_len;
+        if (!AtLineStart(p)) a = p - ls <= CHUNK / 2 ? ls : p - (g_pc[k - 1].len <= 2 * SMALL ? g_pc[k - 1].len : SMALL);
+        if (!AtLineEnd(e)) b = le - e <= CHUNK / 2 ? le : e + (g_pc[k + 1].len <= 2 * SMALL ? g_pc[k + 1].len : SMALL);
+    }
+    return Materialize(a, b);
+}
+/* gives back add blocks no piece points into, and the pages of the original text no piece uses */
+static void ReleaseUnused(void) {
+    g_gcDue = FALSE;
+    BYTE *live = calloc(g_nblk + 1, 1); if (!live) return;
+    uintptr_t o0 = (uintptr_t)g_org, o1 = o0 + (g_orgCap + 1) * sizeof(WCHAR), last = o0;
+    BOOL mono = TRUE; size_t j = 0;
+    for (size_t k = 0; k < g_npc; k++) {
+        uintptr_t p = (uintptr_t)g_pc[k].p;
+        if (g_org && p >= o0 && p < o1) { if (p < last) mono = FALSE; last = p + g_pc[k].len * sizeof(WCHAR); continue; }
+        for (size_t n = 0; n < g_nblk; n++, j = (j + 1) % g_nblk)
+            if (p >= (uintptr_t)g_blk[j].p && p < (uintptr_t)(g_blk[j].p + g_blk[j].cap)) { live[j] = 1; break; }
+    }
+    size_t w = 0;
+    for (size_t i = 0; i < g_nblk; i++) {
+        if (live[i] || g_blk[i].p == g_add) g_blk[w++] = g_blk[i]; else free(g_blk[i].p);
+    }
+    g_nblk = w; free(live);
+    if (!g_org || !mono) return;            /* original pieces always stay in text order (they are never moved) */
+    const WCHAR *gap = g_org;
+    for (size_t k = 0; k < g_npc; k++) {
+        const WCHAR *p = g_pc[k].p;
+        if ((uintptr_t)p < o0 || (uintptr_t)p >= o1) continue;
+        Decommit(gap, p); gap = p + g_pc[k].len;
+    }
+    Decommit(gap, g_org + g_orgCap + 1);
+}
+/* about budget units of compaction work; returns TRUE when everything is compact */
+static BOOL CompactStep(int budget) {
+    while (!g_cdone && budget-- > 0) {
+        if (g_cpk >= g_npc) { g_cpk = 0; if (g_cclean) g_cdone = g_gcDue = TRUE; g_cclean = TRUE; continue; }
+        if (PieceGood(g_cpk)) { g_cpk++; continue; }
+        g_cpk = CompactAt(g_cpk); g_cclean = FALSE; budget -= 8;
+    }
+    return g_cdone;
+}
+static void CompactNow(void) {              /* too many pieces: compact everything (memory is released in idle) */
+    for (int g = 0; g < 4096 && !CompactStep(1 << 16); g++) {}
+    g_syncAt = g_npc * 2 > PIECES_COMPACT ? g_npc * 2 : PIECES_COMPACT;
+}
+static BOOL LineContiguous(size_t L) { size_t s = LineStart(L), e = LineEnd(L); return e == s || DocPtr(s, e - s) != NULL; }
+
 
 /* ================================================================== */
 /* state                                                               */
@@ -385,7 +494,7 @@ static BOOL IdleWork(void);
 /* ================================================================== */
 /* undo / redo                                                         */
 /* ================================================================== */
-typedef struct { BOOL ins; size_t pos; WCHAR *s; size_t n; int grp; size_t cb, ab; } Op;
+typedef struct { BOOL ins; size_t pos; WCHAR *s; size_t n; int grp; size_t cb, ab, cap; } Op;
 typedef struct { Op *v; size_t n, cap; } OpStack;
 static OpStack g_undo, g_redo;
 static int g_grp = 1;
@@ -399,19 +508,38 @@ static void OpPush(OpStack *st, Op o) {
 static void OpClear(OpStack *st) { for (size_t i = 0; i < st->n; i++) free(st->v[i].s); st->n = 0; }
 static void NewGroup(void) { g_grp++; }
 static void BreakUndoMerge(void) { g_lastKind = K_NONE; }
+/* the last undo record of the current group, if it can take n more units */
+static Op *OpTail(BOOL ins, size_t n) {
+    Op *t = g_undo.n ? &g_undo.v[g_undo.n - 1] : NULL;
+    if (!t || t->ins != ins || t->grp != g_grp) return NULL;
+    if (t->n + n > t->cap) { t->cap = (t->n + n) * 2; t->s = xrealloc(t->s, t->cap * sizeof(WCHAR)); }
+    return t;
+}
 static void EditInsert(size_t p, const WCHAR *s, size_t n) {
     if (!n) return;
-    Op o = { TRUE, p, xmalloc(n * sizeof(WCHAR)), n, g_grp, g_caret, g_anchor };
-    memcpy(o.s, s, n * sizeof(WCHAR));
-    OpPush(&g_undo, o); OpClear(&g_redo);
+    Op *t = g_undo.n && g_undo.v[g_undo.n - 1].pos + g_undo.v[g_undo.n - 1].n == p ? OpTail(TRUE, n) : NULL;
+    if (t) { memcpy(t->s + t->n, s, n * sizeof(WCHAR)); t->n += n; }      /* typing: "ab" at p == "a" at p, "b" at p+1 */
+    else {
+        Op o = { TRUE, p, xmalloc(n * sizeof(WCHAR)), n, g_grp, g_caret, g_anchor, n };
+        memcpy(o.s, s, n * sizeof(WCHAR));
+        OpPush(&g_undo, o);
+    }
+    OpClear(&g_redo);
     RawInsert(p, s, n);
     g_modified = TRUE;
 }
 static void EditDelete(size_t p, size_t n) {
     if (!n) return;
-    Op o = { FALSE, p, xmalloc(n * sizeof(WCHAR)), n, g_grp, g_caret, g_anchor };
-    DocGet(p, n, o.s);
-    OpPush(&g_undo, o); OpClear(&g_redo);
+    Op *t = NULL;
+    if (g_undo.n) { const Op *l = &g_undo.v[g_undo.n - 1]; if (l->pos == p || p + n == l->pos) t = OpTail(FALSE, n); }
+    if (t && t->pos == p) { DocGet(p, n, t->s + t->n); t->n += n; }                   /* Delete key */
+    else if (t) { memmove(t->s + n, t->s, t->n * sizeof(WCHAR)); DocGet(p, n, t->s); t->n += n; t->pos = p; }   /* Backspace */
+    else {
+        Op o = { FALSE, p, xmalloc(n * sizeof(WCHAR)), n, g_grp, g_caret, g_anchor, n };
+        DocGet(p, n, o.s);
+        OpPush(&g_undo, o);
+    }
+    OpClear(&g_redo);
     RawDelete(p, n);
     g_modified = TRUE;
 }
@@ -552,7 +680,7 @@ static int CharW(UINT c) {
     }
     if (g_wsupN * 2 >= g_wsupCap) {         /* grow + rehash */
         WEnt *o = g_wsup; size_t oc = g_wsupCap;
-        g_wsupCap = oc ? oc * 2 : 256; g_wsup = calloc(g_wsupCap, sizeof(WEnt)); if (!g_wsup) xrealloc(NULL, (size_t)-1);
+        g_wsupCap = oc ? oc * 2 : 256; g_wsup = calloc(g_wsupCap, sizeof(WEnt)); if (!g_wsup) NoMem();
         for (size_t i = 0; i < oc; i++) if (o[i].cp) {
             size_t h = (o[i].cp * 2654435761u) & (g_wsupCap - 1);
             while (g_wsup[h].cp) h = (h + 1) & (g_wsupCap - 1);
@@ -605,8 +733,8 @@ static Ln LnOf(size_t L, BOOL withComp) {
         ln.co = (int)(g_cpos - s); ln.n += g_clen; ln.li = &g_ci;
         if (g_ciL != L || g_ciDV != g_docVer || g_ciCV != g_compVer) { InfoReset(&g_ci); g_ciL = L; g_ciDV = g_docVer; g_ciCV = g_compVer; }
     } else {
-        if (!g_lm[L].li) { g_lm[L].li = calloc(1, sizeof(LineInfo)); if (!g_lm[L].li) xrealloc(NULL, (size_t)-1); InfoReset(g_lm[L].li); g_ninfo++; }
-        ln.li = g_lm[L].li;
+        if (!g_lm[L].li) g_lm[L].li = InfoNew();
+        ln.li = g_info[g_lm[L].li];
     }
     return ln;
 }
@@ -1074,56 +1202,79 @@ static void CutSel(void) {
 }
 
 /* ================================================================== */
-/* file I/O (large-file aware: decode straight into the original text) */
+/* file I/O (large-file aware: decoded chunk by chunk straight into the original text) */
 /* ================================================================== */
 static void ResetDoc(void) {
     OpClear(&g_undo); OpClear(&g_redo);
     g_caret = g_anchor = 0; g_top = 0; g_topRow = 0; g_sx = 0; g_maxW = 0; g_wantX = -1; g_aff = FALSE;
     g_modified = FALSE; BreakUndoMerge(); g_docVer++;
 }
-/* takes ownership of buf (text length n): it becomes the immutable original text */
-static void AdoptDoc(WCHAR *buf, size_t n) {
-    PtAdopt(buf, n);
+/* takes ownership of buf (text length n, from OrgAlloc(cap)): it becomes the immutable original text */
+static void AdoptDoc(WCHAR *buf, size_t n, size_t cap) {
+    PtAdopt(buf, n, cap);
     RebuildLines(); g_docVer++;
 }
 static void SetDocText(const WCHAR *t, size_t n) {
-    WCHAR *b = xmalloc((n + 1) * sizeof(WCHAR));
+    WCHAR *b = OrgAlloc(n);
+    if (!b) NoMem();
     if (n) memcpy(b, t, n * sizeof(WCHAR));
-    AdoptDoc(b, n);
+    AdoptDoc(b, n, n);
+}
+#define LOAD_CHUNK (1u << 22)               /* bytes read and decoded at a time */
+static DWORD CharCut(const BYTE *b, DWORD m, UINT cp) {   /* start of the last character in b[0, m) */
+    if (cp == CP_UTF8) { DWORD j = m - 1; while (j > 0 && m - j < 4 && (b[j] & 0xC0) == 0x80) j--; return j; }
+    static BYTE lead[256]; static BOOL init;
+    if (!init) { for (int c = 0; c < 256; c++) lead[c] = IsDBCSLeadByteEx(932, (BYTE)c) ? 1 : 0; init = TRUE; }
+    DWORD i = 0, last = 0;
+    while (i < m) { last = i; i += lead[b[i]] ? 2u : 1u; }
+    return last;
 }
 static BOOL g_loadQuiet;
+/* The file is read in chunks and each chunk is decoded straight into the original-text buffer, so the
+   raw bytes are never held as a whole. UTF-8 BOM / UTF-16LE BOM / strict UTF-8, else Shift_JIS (CP932). */
 static BOOL LoadFile(const WCHAR *path) {
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (f == INVALID_HANDLE_VALUE) { if (!g_loadQuiet) MessageBoxW(g_frame, L"ファイルを開けません。", APPNAME, MB_ICONERROR); return FALSE; }
     LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
     if (sz.QuadPart > 0x7FFFFFF0LL) { CloseHandle(f); MessageBoxW(g_frame, L"ファイルが大きすぎます (2GB 以上)。", APPNAME, MB_ICONERROR); return FALSE; }
     HCURSOR oc = SetCursor(LoadCursorW(NULL, IDC_WAIT));
-    DWORD n = (DWORD)sz.QuadPart, rd = 0;
-    BYTE *b = malloc((size_t)n + 4);
-    if (!b) { CloseHandle(f); SetCursor(oc); MessageBoxW(g_frame, L"メモリ不足です。", APPNAME, MB_ICONERROR); return FALSE; }
-    BOOL ok = TRUE; DWORD got = 0;
-    while (got < n) { DWORD chunk = n - got > (1u << 26) ? (1u << 26) : n - got; if (!ReadFile(f, b + got, chunk, &rd, NULL) || rd == 0) { ok = rd == 0 && got == n; break; } got += rd; }
-    CloseHandle(f);
-    if (!ok || got != n) { free(b); SetCursor(oc); MessageBoxW(g_frame, L"読み込みに失敗しました。", APPNAME, MB_ICONERROR); return FALSE; }
-    int enc = 0; const char *src = (const char *)b; int sn = (int)n; UINT cp = CP_UTF8;
-    if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) { enc = 1; src += 3; sn -= 3; }
-    else if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE) enc = 3;
-    WCHAR *w; size_t wn;
-    if (enc == 3) {
-        wn = (n - 2) / 2;
-        w = malloc((wn + 1) * sizeof(WCHAR));
-        if (w) memcpy(w, b + 2, wn * 2);
-    } else {
-        int need = sn ? MultiByteToWideChar(CP_UTF8, enc == 1 ? 0 : MB_ERR_INVALID_CHARS, src, sn, NULL, 0) : 0;
-        if (sn && need == 0) { enc = 2; cp = 932; need = MultiByteToWideChar(932, 0, src, sn, NULL, 0); }
-        wn = (size_t)need;
-        w = malloc((wn + 1) * sizeof(WCHAR));
-        if (w && sn) MultiByteToWideChar(cp, 0, src, sn, w, need);
+    DWORD n = (DWORD)sz.QuadPart, rd = 0, skip = 0;
+    BYTE h[3] = { 0, 0, 0 };
+    BOOL ok = ReadFile(f, h, n < 3 ? n : 3, &rd, NULL);
+    int enc = 0;
+    if (n >= 3 && h[0] == 0xEF && h[1] == 0xBB && h[2] == 0xBF) { enc = 1; skip = 3; }
+    else if (n >= 2 && h[0] == 0xFF && h[1] == 0xFE) { enc = 3; skip = 2; }
+    size_t cap = enc == 3 ? (n - 2) / 2 : n, wn = 0;   /* UTF-8 / CP932: at most one unit per byte */
+    WCHAR *w = OrgAlloc(cap); BYTE *b = malloc(LOAD_CHUNK + 8);
+    if (!w || !b) { free(b); OrgFree(w); CloseHandle(f); SetCursor(oc); MessageBoxW(g_frame, L"メモリ不足です。", APPNAME, MB_ICONERROR); return FALSE; }
+    UINT cp = CP_UTF8; DWORD flags = enc == 0 ? MB_ERR_INVALID_CHARS : 0;
+    for (BOOL again = TRUE; ok && again; ) {    /* one decoding pass; repeated as CP932 if strict UTF-8 fails */
+        again = FALSE;
+        LARGE_INTEGER z; z.QuadPart = skip; ok = SetFilePointerEx(f, z, NULL, FILE_BEGIN);
+        DWORD left = n - skip, carry = 0; wn = 0;
+        while (ok && (left || carry)) {
+            DWORD want = left > LOAD_CHUNK ? LOAD_CHUNK : left;
+            if (enc == 3) {                 /* UTF-16LE: read straight into the text */
+                if (want > (cap - wn) * 2) want = (DWORD)((cap - wn) * 2);
+                ok = want && ReadFile(f, (BYTE *)(w + wn), want, &rd, NULL) && rd == want; wn += want / 2; left -= want;
+                if ((cap - wn) == 0) left = 0;
+                continue;
+            }
+            if (want) { ok = ReadFile(f, b + carry, want, &rd, NULL) && rd == want; if (!ok) break; left -= want; }
+            DWORD m = carry + want, c = left ? CharCut(b, m, cp) : m;
+            if (c) {
+                int r = MultiByteToWideChar(cp, flags, (const char *)b, (int)c, w + wn, (int)(cap - wn));
+                if (r <= 0) { if (cp == CP_UTF8 && enc == 0) { cp = 932; flags = 0; enc = 2; again = TRUE; } else ok = FALSE; break; }
+                wn += (size_t)r;
+            }
+            carry = m - c; memmove(b, b + c, carry);
+        }
     }
-    free(b);
-    if (!w) { SetCursor(oc); MessageBoxW(g_frame, L"メモリ不足です。", APPNAME, MB_ICONERROR); return FALSE; }
-    wn = NormalizeNewlines(w, wn);
-    AdoptDoc(w, wn);
+    CloseHandle(f); free(b);
+    if (!ok) { OrgFree(w); SetCursor(oc); MessageBoxW(g_frame, L"読み込みに失敗しました。", APPNAME, MB_ICONERROR); return FALSE; }
+    wn = NormalizeNewlines(w, wn); w[wn] = 0;
+    Decommit(w + wn + 1, w + cap + 1);      /* the part the text did not need (CRLF, multi-byte) */
+    AdoptDoc(w, wn, cap);
     ResetDoc(); g_enc = enc;
     wcsncpy(g_path, path, sizeof g_path / sizeof g_path[0] - 1);
     g_maxW = 0; g_layoutVer++;
@@ -1156,7 +1307,6 @@ static BOOL SaveFile(const WCHAR *path) {
     CloseHandle(f);
     if (!ok) { MessageBoxW(g_frame, L"保存に失敗しました。", APPNAME, MB_ICONERROR); return FALSE; }
     g_enc = enc; g_modified = FALSE;
-    Compact();                              /* the saved text becomes the new original: one piece */
     if (path != g_path) wcsncpy(g_path, path, sizeof g_path / sizeof g_path[0] - 1);
     UpdateTitle();
     return TRUE;
@@ -1369,8 +1519,12 @@ static void PlaceCaret(void) {
 static WCHAR *g_fbuf; static size_t g_fbcap;
 static int g_fm[1024]; static int g_nfm;
 static size_t g_curMA = (size_t)-1, g_curMB;
+/* text of line L: in place when it is contiguous (almost always after compaction), else copied */
 static const WCHAR *LineText(size_t L, int *n) {
     size_t s = LineStart(L), len = LineEnd(L) - s;
+    *n = (int)len;
+    const WCHAR *d = DocPtr(s, len);
+    if (d) return d;
     if (len + 1 > g_fbcap) { g_fbcap = len + 256; g_fbuf = xrealloc(g_fbuf, g_fbcap * sizeof(WCHAR)); }
     DocGet(s, len, g_fbuf); g_fbuf[len] = 0;
     *n = (int)len;
@@ -3634,6 +3788,33 @@ static BOOL IndexConsistent(void) {        /* incremental line index vs full rec
         if (DocAt(i) == L'\n') { L++; if (L >= g_nl || LineStart(L) != i + 1) return FALSE; }
     return L + 1 == g_nl;
 }
+static int CompactAll(void) { int g = 0; while (!CompactStep(1 << 16) && g < 100000) g++; ReleaseUnused(); return g; }
+static int CollectMatches(size_t *out, int max) {   /* all matches by repeated FindFrom (stops when it wraps) */
+    size_t a, b, pos = 0; int k = 0;
+    while (k + 2 <= max && FindFrom(pos, TRUE, &a, &b)) {
+        if (k && a <= out[k - 2]) break;
+        out[k++] = a; out[k++] = b; pos = b;
+    }
+    return k;
+}
+static int RefMatches(Regex *re, const WCHAR *ref, size_t rn, size_t *out, int max) {
+    int k = 0, caps[2 * RE_NCAP];
+    for (size_t s0 = 0; s0 <= rn; ) {
+        size_t e = s0; while (e < rn && ref[e] != L'\n') e++;
+        int n = (int)(e - s0), s = 0;
+        while (s <= n && k + 2 <= max && re_search(re, (const rechar *)ref + s0, n, s, caps)) {
+            if (caps[1] > caps[0]) { out[k++] = s0 + (size_t)caps[0]; out[k++] = s0 + (size_t)caps[1]; s = caps[1]; } else s = caps[0] + 1;
+        }
+        s0 = e + 1;
+    }
+    return k;
+}
+static char *ReadAll(const WCHAR *p, size_t *n) {
+    HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    DWORD sz = GetFileSize(f, NULL), rd = 0; char *b = xmalloc((size_t)sz + 1);
+    ReadFile(f, b, sz, &rd, NULL); CloseHandle(f); *n = rd; return b;
+}
 static double NowMs(void);
 static void SetComp(const WCHAR *comp) {
     BeginComp();
@@ -3891,10 +4072,10 @@ static void RunSelfTest(void) {
         size_t pieces = g_npc;
         snprintf(buf, sizeof buf, "piece table: 6000 random edits vs reference string, mismatches=%d (len=%u pieces=%u lines=%u)", bad, (unsigned)rn, (unsigned)pieces, (unsigned)g_nl);
         STCheck(bad == 0 && pieces > 1, buf);
-        Compact();
+        CompactAll();
         DocGet(0, DocLen(), tmp);
-        BOOL ok = g_npc == 1 && DocLen() == rn && !memcmp(tmp, ref, rn * sizeof(WCHAR)) && IndexConsistent();
-        snprintf(buf, sizeof buf, "piece table: consolidation %u pieces -> %u, text and line index unchanged=%d", (unsigned)pieces, (unsigned)g_npc, ok);
+        BOOL ok = g_npc < pieces && DocLen() == rn && !memcmp(tmp, ref, rn * sizeof(WCHAR)) && IndexConsistent();
+        snprintf(buf, sizeof buf, "piece table: compaction %u pieces -> %u, text and line index unchanged=%d", (unsigned)pieces, (unsigned)g_npc, ok);
         STCheck(ok, buf);
         free(ref); free(tmp);
     }
@@ -3918,6 +4099,201 @@ static void RunSelfTest(void) {
         snprintf(buf, sizeof buf, "undo/redo: 400 random edits, %d undo steps restore the original=%d, redo restores the result=%d", undos, u, rr);
         STCheck(u && rr, buf);
         free(orig); free(fin);
+    }
+    /* ---- 5j. v1.3: background compaction, in-place search, long-line chunks, save, released memory, loading ---- */
+    {   /* random edits interleaved with idle compaction steps vs a reference string; undo / redo across compaction */
+        size_t cap = 1 << 20, n = 0; WCHAR *t = xmalloc(cap * sizeof(WCHAR));
+        for (int L = 0; L < 3000; L++) {
+            if (L == 1500) { for (int i = 0; i < 60000; i++) t[n++] = L"長い行の中身abcdefg "[i % 13]; t[n++] = L'\n'; }
+            n += (size_t)swprintf(t + n, 80, L"%04d: 行のテキスト line text %d\n", L, L * 7);
+        }
+        t[n] = 0; SetTextForTest(t);
+        WCHAR *ref = xmalloc(cap * sizeof(WCHAR)); memcpy(ref, t, n * sizeof(WCHAR)); size_t rn = n;
+        static const WCHAR *const ins[] = { L"x", L"かな", L"\n", L"😀", L"ab\ncd", L"挿入テキスト挿入テキスト" };
+        unsigned seed = 777; int bad = 0, steps = 0;
+        for (int it = 0; it < 3000; it++) {
+            seed = seed * 1103515245u + 12345u;
+            size_t len = DocLen(), p = (seed >> 8) % (len + 1);
+            NewGroup();
+            if ((seed >> 4) % 3 == 0 && len) {
+                size_t k = 1 + (seed >> 12) % 40; if (p + k > len) k = len - p;
+                EditDelete(p, k); memmove(ref + p, ref + p + k, (rn - p - k) * sizeof(WCHAR)); rn -= k;
+            } else {
+                const WCHAR *s = ins[(seed >> 16) % 6]; size_t m = wcslen(s);
+                if (rn + m >= cap) break;
+                EditInsert(p, s, m); memmove(ref + p + m, ref + p, (rn - p) * sizeof(WCHAR)); memcpy(ref + p, s, m * sizeof(WCHAR)); rn += m;
+            }
+            if ((seed >> 20) % 4 == 0) { CompactStep((int)((seed >> 22) % 300)); steps++; }
+            if ((seed >> 24) % 64 == 0) ReleaseUnused();
+            if (it % 300 == 299) { DocGet(0, DocLen(), t); if (DocLen() != rn || memcmp(t, ref, rn * sizeof(WCHAR)) || !IndexConsistent()) bad++; }
+        }
+        size_t pc0 = g_npc; int g = CompactAll();
+        DocGet(0, DocLen(), t);
+        BOOL same = DocLen() == rn && !memcmp(t, ref, rn * sizeof(WCHAR)) && IndexConsistent();
+        size_t split = 0; for (size_t L = 0; L < g_nl; L++) if (LineEnd(L) - LineStart(L) <= CHUNK / 2 && !LineContiguous(L)) split++;
+        snprintf(buf, sizeof buf, "compaction: 3000 random edits with %d idle compaction steps vs reference, mismatches=%d; full compaction (%d slices) %u -> %u pieces, text same=%d, short lines not contiguous=%u",
+                 steps, bad, g, (unsigned)pc0, (unsigned)g_npc, same, (unsigned)split);
+        STCheck(bad == 0 && same && g_cdone && split == 0 && g_npc < pc0, buf);
+        WCHAR *fin = ref; ref = xmalloc(cap * sizeof(WCHAR));
+        int u = 0; while (g_undo.n) { Undo(); if (++u % 37 == 0) { CompactStep(400); ReleaseUnused(); } }
+        DocGet(0, DocLen(), ref);
+        size_t n2 = 0;                      /* t was overwritten above: rebuild the original */
+        for (int L = 0; L < 3000; L++) {
+            if (L == 1500) { for (int i = 0; i < 60000; i++) t[n2++] = L"長い行の中身abcdefg "[i % 13]; t[n2++] = L'\n'; }
+            n2 += (size_t)swprintf(t + n2, 80, L"%04d: 行のテキスト line text %d\n", L, L * 7);
+        }
+        BOOL uo = DocLen() == n2 && !memcmp(ref, t, n2 * sizeof(WCHAR)) && IndexConsistent();
+        int r = 0; while (g_redo.n) { Redo(); if (++r % 41 == 0) { CompactStep(400); ReleaseUnused(); } }
+        CompactAll(); DocGet(0, DocLen(), ref);
+        BOOL ro = DocLen() == rn && !memcmp(ref, fin, rn * sizeof(WCHAR)) && IndexConsistent();
+        snprintf(buf, sizeof buf, "compaction: %d undo steps interleaved with compaction restore the original=%d, %d redo steps restore the result=%d", u, uo, r, ro);
+        STCheck(uo && ro, buf);
+        free(t); free(ref); free(fin);
+    }
+    {   /* search on in-place (compacted) and copied (not yet compacted) lines == reference search */
+        static const WCHAR *const words[] = { L"foo12", L"bar", L"fooo7", L"ばー", L"バー", L"x", L"foo", L"f0o9", L" ", L"漢字" };
+        size_t cap = 1 << 19, n = 0; WCHAR *t = xmalloc(cap * sizeof(WCHAR)); unsigned seed = 31337;
+        for (int L = 0; L < 2000; L++) {
+            seed = seed * 1103515245u + 12345u;
+            for (int w = (int)((seed >> 8) % 12); w > 0; w--) { seed = seed * 1103515245u + 12345u; const WCHAR *s = words[(seed >> 10) % 10]; size_t m = wcslen(s); memcpy(t + n, s, m * sizeof(WCHAR)); n += m; }
+            t[n++] = L'\n';
+        }
+        t[n] = 0; SetTextForTest(t);
+        int ep; Regex *re = re_compile((const rechar *)L"fo+\\d+|バー", 10, 0, &ep), *sv = g_re; g_re = re;
+        int bad = 0; size_t *got = xmalloc(40000 * sizeof(size_t)), *exp = xmalloc(40000 * sizeof(size_t));
+        size_t inplace = 0, copied = 0;
+        for (int round = 0; round < 2; round++) {
+            for (int it = 0; it < 1500; it++) {
+                seed = seed * 1103515245u + 12345u;
+                size_t len = DocLen(), p = (seed >> 8) % (len + 1);
+                NewGroup();
+                if ((seed >> 4) % 4 == 0 && len) { size_t k = 1 + (seed >> 12) % 5; if (p + k > len) k = len - p; EditDelete(p, k); }
+                else { const WCHAR *s = words[(seed >> 16) % 10]; EditInsert(p, s, wcslen(s)); }
+                if ((seed >> 22) % 8 == 0) CompactStep(64);
+            }
+            for (size_t L = 0; L < g_nl; L++) { if (LineContiguous(L)) inplace++; else copied++; }
+            size_t rn = DocLen(); WCHAR *ref = xmalloc((rn + 1) * sizeof(WCHAR)); DocGet(0, rn, ref);
+            int k1 = CollectMatches(got, 40000), k2 = RefMatches(re, ref, rn, exp, 40000);
+            if (k1 != k2 || memcmp(got, exp, (size_t)k1 * sizeof(size_t))) bad++;
+            CompactAll();
+            int k3 = CollectMatches(got, 40000);
+            if (k3 != k2 || memcmp(got, exp, (size_t)k3 * sizeof(size_t))) bad++;
+            snprintf(buf, sizeof buf, "  round %d: %d matches", round, k2 / 2); STLog("%s\n", buf);
+            free(ref);
+        }
+        snprintf(buf, sizeof buf, "search: in-place lines (%u) and copied lines (%u) vs reference search, 2 rounds before/after compaction: mismatching rounds=%d",
+                 (unsigned)inplace, (unsigned)copied, bad);
+        STCheck(bad == 0 && inplace > 0 && copied > 0, buf);
+        g_re = sv; re_free(re); free(got); free(exp); free(t);
+    }
+    {   /* a very long line is stored in chunks; matches across chunk borders, caret and End treat it as one line */
+        size_t N = 300000; WCHAR *t = xmalloc((N + 16) * sizeof(WCHAR)); unsigned seed = 4711;
+        for (size_t i = 0; i < N; i++) { seed = seed * 1103515245u + 12345u; t[i] = (WCHAR)(L'a' + (seed >> 16) % 26); }
+        wcscpy(t + N, L"\n二行目"); SetTextForTest(t);
+        size_t rn = N + 4; WCHAR *ref = xmalloc((rn + 400) * sizeof(WCHAR)); memcpy(ref, t, rn * sizeof(WCHAR));
+        for (int k = 0; k < 200; k++) {
+            seed = seed * 1103515245u + 12345u; size_t p = (seed >> 4) % LineEnd(0);
+            NewGroup(); EditInsert(p, L"Q", 1); memmove(ref + p + 1, ref + p, (rn - p) * sizeof(WCHAR)); ref[p] = L'Q'; rn++;
+        }
+        CompactAll(); ref[rn] = 0;
+        size_t e0 = LineEnd(0), pcs = 0; int tried = 0, bad = 0;
+        for (size_t k = 0; k < g_npc && g_pc[k].pos < e0; k++) {
+            pcs++;
+            size_t q = g_pc[k].pos;
+            if (q < 8 || q + 8 > e0 || tried >= 40) continue;
+            WCHAR nd[16]; memcpy(nd, ref + q - 5, 10 * sizeof(WCHAR)); nd[10] = 0;
+            const WCHAR *f = wcsstr(ref, nd); size_t want = (size_t)(f - ref);
+            int ep; Regex *re = re_compile((const rechar *)nd, 10, 0, &ep), *sv = g_re; g_re = re;
+            size_t a = 0, b = 0; BOOL ok = FindFrom(0, TRUE, &a, &b);
+            g_re = sv; re_free(re); tried++;
+            if (!ok || a != want || b != want + 10) bad++;
+        }
+        int n; const WCHAR *lt = LineText(0, &n);
+        BOOL one = g_nl == 2 && (size_t)n == e0 && !memcmp(lt, ref, e0 * sizeof(WCHAR)) && !LineContiguous(0);
+        g_caret = g_anchor = 0; OnKeyDown(VK_END); BOOL end = g_caret == e0;
+        snprintf(buf, sizeof buf, "long line: 300000 chars + 200 edits stored as %u pieces; matches across %d chunk borders found=%d/%d, one logical line=%d, End -> line end=%d",
+                 (unsigned)pcs, tried, tried - bad, tried, one, end);
+        STCheck(pcs > 10 && tried > 10 && bad == 0 && one && end, buf);
+        free(t); free(ref);
+    }
+    {   /* save output: uncompacted == compacted == reference */
+        size_t cap = 200000, n = 0; WCHAR *t = xmalloc(cap * sizeof(WCHAR));
+        for (int L = 0; L < 2000; L++) n += (size_t)swprintf(t + n, 64, L"保存テスト %d 😀\tend\n", L);
+        t[n] = 0; SetTextForTest(t); int e0 = g_enc; g_enc = 0;
+        unsigned seed = 5; static const WCHAR *const ins[] = { L"y", L"\n", L"日本", L"😀" };
+        for (int it = 0; it < 500; it++) {
+            seed = seed * 1103515245u + 12345u; size_t len = DocLen(), p = (seed >> 8) % (len + 1);
+            if (p < len && IS_LO(DocAt(p))) p--;
+            NewGroup();
+            if ((seed >> 4) % 3 == 0 && p + 2 <= len && !IS_HI(DocAt(p + 1)) && !IS_LO(DocAt(p))) EditDelete(p, 1);
+            else { const WCHAR *s = ins[(seed >> 16) % 4]; EditInsert(p, s, wcslen(s)); }
+        }
+        size_t rn = DocLen(); WCHAR *ref = xmalloc((rn * 2 + 1) * sizeof(WCHAR)); DocGet(0, rn, ref);
+        WCHAR *crlf = xmalloc((rn * 2 + 1) * sizeof(WCHAR)); size_t cn = 0;
+        for (size_t i = 0; i < rn; i++) { if (ref[i] == L'\n') crlf[cn++] = L'\r'; crlf[cn++] = ref[i]; }
+        int en = WideCharToMultiByte(CP_UTF8, 0, crlf, (int)cn, NULL, 0, NULL, NULL); char *exp = xmalloc((size_t)en + 1);
+        WideCharToMultiByte(CP_UTF8, 0, crlf, (int)cn, exp, en, NULL, NULL);
+        WCHAR tmp[MAX_PATH], p1[MAX_PATH], p2[MAX_PATH], keep[MAX_PATH * 4]; GetTempPathW(MAX_PATH, tmp); wcscpy(keep, g_path);
+        _snwprintf(p1, MAX_PATH, L"%lsced_st_save1.txt", tmp); _snwprintf(p2, MAX_PATH, L"%lsced_st_save2.txt", tmp);
+        size_t pc0 = g_npc; BOOL s1 = SaveFile(p1); size_t pc1 = g_npc; CompactAll(); BOOL s2 = SaveFile(p2);
+        size_t l1, l2; char *b1 = ReadAll(p1, &l1), *b2 = ReadAll(p2, &l2);
+        BOOL ok = s1 && s2 && b1 && b2 && l1 == (size_t)en && l2 == (size_t)en && !memcmp(b1, exp, (size_t)en) && !memcmp(b2, exp, (size_t)en);
+        snprintf(buf, sizeof buf, "save: %u pieces (save keeps them: %u) and after compaction (%u): both files == reference UTF-8/CRLF (%d bytes) = %d",
+                 (unsigned)pc0, (unsigned)pc1, (unsigned)g_npc, en, ok);
+        STCheck(ok && pc1 == pc0 && pc0 > 100, buf);
+        DeleteFileW(p1); DeleteFileW(p2); wcscpy(g_path, keep); g_enc = e0; g_modified = FALSE;
+        free(b1); free(b2); free(exp); free(crlf); free(ref); free(t);
+    }
+    {   /* deleted original text: its pages are given back; undo still restores it */
+        size_t N = 2000000; WCHAR *t = xmalloc((N + 1) * sizeof(WCHAR));
+        for (size_t i = 0; i < N; i++) t[i] = i % 100 == 99 ? L'\n' : (WCHAR)(L'あ' + i % 50);
+        t[N] = 0; SetTextForTest(t);
+        PROCESS_MEMORY_COUNTERS m0, m1; GetProcessMemoryInfo(GetCurrentProcess(), &m0, sizeof m0);
+        NewGroup(); EditDelete(200000, 1500000); CompactAll();
+        GetProcessMemoryInfo(GetCurrentProcess(), &m1, sizeof m1);
+        MEMORY_BASIC_INFORMATION mi; VirtualQuery(g_org + 1000000, &mi, sizeof mi);
+        BOOL rel = mi.State == MEM_RESERVE, text = DocLen() == N - 1500000 && DocAt(199999) == t[199999] && DocAt(200000) == t[1700000];
+        Undo(); BOOL back = DocEquals(t) && IndexConsistent();
+        snprintf(buf, sizeof buf, "release: 1.5M deleted chars -> original pages decommitted=%d (private %.1f -> %.1f MB), text ok=%d, undo restores=%d",
+                 rel, m0.PagefileUsage / 1048576.0, m1.PagefileUsage / 1048576.0, text, back);
+        STCheck(rel && text && back, buf);
+        free(t);
+    }
+    {   /* chunked loading: chunk borders inside multi-byte characters, all encodings */
+        WCHAR tmp[MAX_PATH], fp[MAX_PATH], keep[MAX_PATH * 4]; GetTempPathW(MAX_PATH, tmp); wcscpy(keep, g_path);
+        _snwprintf(fp, MAX_PATH, L"%lsced_st_load.txt", tmp);
+        static const WCHAR *const unit[] = { L"日本語テキスト😀abc\r\n", L"ﾃｽﾄ日本語abc\r\n" };
+        int fails = 0; char what[160] = "";
+        for (int v = 0; v < 4; v++) {           /* 0 = UTF-8 (9 MB), 1 = CP932 (9 MB), 2 = UTF-8 BOM, 3 = UTF-16LE BOM */
+            const WCHAR *u = unit[v == 1]; size_t ul = wcslen(u), reps = v < 2 ? 9000000 / (ul * 2) : 1000, wn = ul * reps;
+            WCHAR *w = xmalloc((wn + 1) * sizeof(WCHAR)); for (size_t i = 0; i < reps; i++) memcpy(w + i * ul, u, ul * sizeof(WCHAR));
+            size_t bn = 0; char *bytes = xmalloc(wn * 4 + 8);
+            if (v == 2) { memcpy(bytes, "\xEF\xBB\xBF", 3); bn = 3; }
+            if (v == 3) { memcpy(bytes, "\xFF\xFE", 2); memcpy(bytes + 2, w, wn * 2); bn = 2 + wn * 2; }
+            else bn += (size_t)WideCharToMultiByte(v == 1 ? 932 : CP_UTF8, 0, w, (int)wn, bytes + bn, (int)(wn * 4), NULL, NULL);
+            HANDLE f = CreateFileW(fp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL); DWORD wr;
+            WriteFile(f, bytes, (DWORD)bn, &wr, NULL); CloseHandle(f);
+            wn = NormalizeNewlines(w, wn); w[wn] = 0;
+            g_loadQuiet = TRUE; BOOL ok = LoadFile(fp); g_loadQuiet = FALSE;
+            static const int encs[] = { 0, 2, 1, 3 };
+            ok = ok && g_enc == encs[v] && DocEquals(w) && IndexConsistent();
+            if (!ok) { fails++; snprintf(what + strlen(what), sizeof what - strlen(what), " v%d(enc=%d len=%u/%u)", v, g_enc, (unsigned)DocLen(), (unsigned)wn); }
+            free(w); free(bytes);
+        }
+        DeleteFileW(fp); wcscpy(g_path, keep); g_enc = 0;
+        snprintf(buf, sizeof buf, "load: chunked decoding of 9 MB UTF-8 / 9 MB Shift_JIS / UTF-8 BOM / UTF-16LE files == expected text, failures=%d%s", fails, what);
+        STCheck(fails == 0, buf);
+    }
+    {   /* undo records: typing / Backspace extend the last record of their group; undo steps unchanged */
+        SetTextForTest(L"abc"); g_caret = g_anchor = 3;
+        for (int i = 0; i < 30; i++) OnChar(L'x');
+        size_t r1 = g_undo.n;
+        for (int i = 0; i < 10; i++) OnKeyDown(VK_BACK);
+        size_t r2 = g_undo.n;
+        BOOL a = DocLen() == 23; Undo(); BOOL b = DocLen() == 33; Undo(); BOOL c = DocEquals(L"abc");
+        Redo(); Redo(); BOOL d = DocLen() == 23 && g_caret == 23;
+        snprintf(buf, sizeof buf, "undo records: 30 typed chars -> %u record, +10 Backspace -> %u records; undo steps restore 33 / 3 chars=%d, redo=%d", (unsigned)r1, (unsigned)r2, a && b && c, d);
+        STCheck(r1 == 1 && r2 == 2 && a && b && c && d, buf);
     }
     /* ---- 5c. width dictionary == direct measurement, and lpDx drawing == GDI's own glyph placement ---- */
     {
@@ -4244,7 +4620,7 @@ static void RunSelfTest(void) {
 /* demo (screenshots) and benchmark modes                              */
 /* ================================================================== */
 static const WCHAR kDemoText[] =
-    L"# CEditor 1.2 デモ\n"
+    L"# CEditor 1.3 デモ\n"
     L"\n"
     L"カスタム描画のテキストエディタです。**太字**、*斜体*、***太字斜体***、~~取り消し線~~、`コード`。\n"
     L"全角スペース「　」と半角スペース「 」とタブ「\t」を含む行。\n"
@@ -4396,12 +4772,15 @@ static BOOL IdleWork(void) {
     while (g_wrap && !busy && g_bgL < g_nl) {
         if (g_lm[g_bgL].rows) { g_bgL++; continue; }
         if (g_bgiL != g_bgL || g_bgiDV != g_docVer) { InfoReset(&g_bgi); g_bgiL = g_bgL; g_bgiDV = g_docVer; }
-        Ln ln = { g_bgL, -1, (int)(LineEnd(g_bgL) - LineStart(g_bgL)), g_lm[g_bgL].li ? g_lm[g_bgL].li : &g_bgi };
+        Ln ln = { g_bgL, -1, (int)(LineEnd(g_bgL) - LineStart(g_bgL)), g_lm[g_bgL].li ? LI(g_bgL) : &g_bgi };
         EnsureRows(&ln, (ln.li->rw == W ? ln.li->nr : 0) + 256);
         if (ln.li->rdone && !g_lm[g_bgL].rows) SetRowCount(g_bgL, ln.li->nr);
         busy = IdleBusy(t0);
     }
-    /* 3) bound the memory of the line cache */
+    /* 3) compaction of the piece table, then give back memory no longer used */
+    while (!busy && !CompactStep(256)) busy = IdleBusy(t0);
+    if (!busy && g_gcDue) { ReleaseUnused(); busy = IdleBusy(t0); }
+    /* 4) bound the memory of the line cache */
     if (g_ninfo > INFO_MAX) {
         size_t a = g_top > INFO_MAX / 4 ? g_top - INFO_MAX / 4 : 0, b = g_top + INFO_MAX / 4;
         for (size_t L = 0; L < g_nl; L++) if (g_lm[L].li && (L < a || L > b) && L != g_ln.L) InfoFree(L);

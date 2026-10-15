@@ -25,7 +25,7 @@ struct Regex {
 };
 
 /* ---------- character helpers ---------- */
-static rechar fold(rechar c) {
+static rechar fold1(rechar c) {
     if (c >= 'A' && c <= 'Z') return (rechar)(c + 32);
     if (c < 0x80) return c;
     if (c >= 0xFF21 && c <= 0xFF3A) return (rechar)(c + 32);
@@ -37,6 +37,11 @@ static rechar fold(rechar c) {
     if (c >= 0x410 && c <= 0x42F) return (rechar)(c + 32);
     return c;
 #endif
+}
+static rechar g_fold[65536]; static int g_foldInit;   /* fold1 of every UTF-16 unit (built once) */
+static rechar fold(rechar c) {
+    if (!g_foldInit) { for (unsigned i = 0; i < 65536; i++) g_fold[i] = fold1((rechar)i); g_foldInit = 1; }
+    return g_fold[(unsigned short)c];
 }
 static int isword(rechar c) {
     if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_') return 1;
@@ -326,7 +331,7 @@ Regex *re_compile(const rechar *pat, int len, int flags, int *errpos) {
     for (int i = 0; i < ps.nall; i++) { free(ps.all[i]->kids); free(ps.all[i]); }
     free(ps.all);
     if (err) { if (errpos) *errpos = ps.i; re_free(re); return NULL; }
-    re->firstch = (re->np > 1 && re->prog[1].op == I_CHAR && !re->icase) ? re->prog[1].x : -1;
+    re->firstch = (re->np > 1 && re->prog[1].op == I_CHAR) ? re->prog[1].x : -1;   /* folded when icase */
     return re;
 }
 void re_free(Regex *re) {
@@ -391,17 +396,21 @@ static int try_at(Regex *re, const rechar *t, int len, int start, int *caps, int
 }
 int re_search(Regex *re, const rechar *text, int len, int start, int *caps) {
     if (!re || start > len) return 0;
-    size_t bits = (size_t)re->np * (size_t)(len + 1);
-    int usevis = bits <= (size_t)256 * 1024 * 1024;     /* <= 32 MB table */
-    if (usevis) {
-        size_t bytes = (bits + 7) / 8;
-        if (bytes > re->viscap) { unsigned char *v = realloc(re->vis, bytes); if (!v) usevis = 0; else { re->vis = v; re->viscap = bytes; } }
-        if (usevis) memset(re->vis, 0, bytes);
-    }
+    int usevis = -1;                        /* memo table: prepared at the first real attempt */
     for (int s = start; s <= len; s++) {
-        if (re->firstch >= 0) {
-            while (s < len && text[s] != re->firstch) s++;
+        if (re->firstch >= 0) {             /* skip to the next possible first character */
+            if (re->icase) while (s < len && fold(text[s]) != re->firstch) s++;
+            else while (s < len && text[s] != re->firstch) s++;
             if (s >= len) return 0;
+        }
+        if (usevis < 0) {
+            size_t bits = (size_t)re->np * (size_t)(len + 1);
+            usevis = bits <= (size_t)256 * 1024 * 1024;     /* <= 32 MB table */
+            if (usevis) {
+                size_t bytes = (bits + 7) / 8;
+                if (bytes > re->viscap) { unsigned char *v = realloc(re->vis, bytes); if (!v) usevis = 0; else { re->vis = v; re->viscap = bytes; } }
+                if (usevis) memset(re->vis, 0, bytes);
+            }
         }
         for (int i = 0; i < 2 * RE_NCAP; i++) caps[i] = -1;
         if (try_at(re, text, len, s, caps, usevis)) return 1;
