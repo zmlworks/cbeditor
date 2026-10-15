@@ -31,7 +31,7 @@
 #include "regex.h"
 
 #define APPNAME   L"CEditor"
-#define APPVER    L"1.3.0"
+#define APPVER    L"1.4.0"
 #define CLS_FRAME L"CEditorFrame"
 #define CLS_TEXT  L"CEditorText"
 #define CLS_FIND  L"CEditorFind"
@@ -74,7 +74,7 @@
 enum { IDM_NEWWIN = 100, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_SAVEINC, IDM_EXIT,
        IDM_UNDO = 200, IDM_REDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_DELETE, IDM_SELALL,
        IDM_RECONV, IDM_FIND, IDM_REPLACE, IDM_FINDNEXT, IDM_FINDPREV,
-       IDM_WRAP = 250, IDM_WS, IDM_MD,
+       IDM_WRAP = 250, IDM_WS, IDM_MD, IDM_LINENO,
        IDM_FONT0 = 300,
        IDM_ZOOMIN = 400, IDM_ZOOMOUT, IDM_ZOOMRESET, IDM_ABOUT };
 
@@ -434,6 +434,10 @@ static HDC g_hdcM;                          /* measuring DC with g_font */
 static int g_fontIdx = 0, g_fontPt10 = 110;
 static UINT g_dpi = 96;
 static int g_lineH = 16, g_ascent = 12, g_tabW = 32, g_margin = 4, g_avgW = 8, g_caretW = 2;
+static int g_textH = 16, g_ty;              /* font height; text top inside a row (half of the extra leading) */
+static int g_gut, g_digitW = 8;             /* line-number gutter width (0 = off or Markdown view) */
+static BOOL g_lineNo;                       /* Ctrl+L */
+static HFONT g_findFontSet;                 /* font the find fields have */
 static unsigned g_layoutVer = 1;            /* bump on font / wrap width change */
 static size_t g_caret, g_anchor;
 static BOOL g_aff;                          /* caret at a wrap boundary drawn at end of previous row */
@@ -480,6 +484,10 @@ static void EnsureVisible(void);
 static void FrameLayout(void);
 static void FindShow(BOOL expanded);
 static void FindHide(void);
+static BOOL IdleBusy(double t0);
+static void StatusUpdate(void);
+static void InvalidateCaption(void);
+static void DoCommand(int id);
 static BOOL FindNext(BOOL forward);
 static void MdInvalidate(void);
 static void CompleteComposition(void);
@@ -820,7 +828,7 @@ static void Win(const Ln *ln, int a, int b) {
 }
 
 /* ---- wrapping ---- */
-static int WrapW(void) { int w = g_cw - 2 * g_margin - g_caretW; return w < g_avgW * 2 ? g_avgW * 2 : w; }
+static int WrapW(void) { int w = g_cw - g_gut - 2 * g_margin - g_caretW; return w < g_avgW * 2 ? g_avgW * 2 : w; }
 static BOOL IsCJK(WCHAR c) { return c >= 0x2E80; }
 static BOOL NoLineStart(WCHAR c) { return c && wcschr(L"、。，．・：；？！゛゜ヽヾゝゞ々ー）］｝」』】〕〉》’”ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ!),.:;?]}", c) != NULL; }
 /* start of the row after the row starting at s (ln->n if the rest fits): break at a space / CJK
@@ -901,7 +909,7 @@ static int RowOf(int idx) {
     return lo;
 }
 static int RowX(int idx, int r) { return XOf(&g_ln, idx) - XOf(&g_ln, RowStart(r)); }
-static int XClient(int x) { return x + g_margin - (g_wrap ? 0 : g_sx); }
+static int XClient(int x) { return x + g_gut + g_margin - (g_wrap ? 0 : g_sx); }
 static int VisLines(void) { int v = g_ch / g_lineH; return v < 1 ? 1 : v; }
 static int CmpLR(size_t L1, int r1, size_t L2, int r2) { if (L1 != L2) return L1 < L2 ? -1 : 1; return r1 < r2 ? -1 : (r1 > r2); }
 /* rows from (L1,r1) to (L2,r2); |result| capped at limit+1 */
@@ -1002,7 +1010,7 @@ static size_t PosFromPointEx(int x, int y, BOOL *aff) {
     long long k = y >= 0 ? y / g_lineH : -((-(long long)y + g_lineH - 1) / g_lineH);
     size_t L = g_top; int r = g_topRow;
     StepRows(&L, &r, k);
-    return PosAtRowX(L, r, x - g_margin + (g_wrap ? 0 : g_sx), aff);
+    return PosAtRowX(L, r, x - g_gut - g_margin + (g_wrap ? 0 : g_sx), aff);
 }
 static size_t PosFromPoint(int x, int y) { return PosFromPointEx(x, y, NULL); }
 
@@ -1010,7 +1018,7 @@ static size_t PosFromPoint(int x, int y) { return PosFromPointEx(x, y, NULL); }
 /* scrolling                                                           */
 /* ================================================================== */
 static int g_mdTop, g_mdH;                  /* markdown view scroll (px) */
-static int ContentW(void) { return g_maxW + g_margin * 2 + g_caretW; }
+static int ContentW(void) { return g_maxW + g_gut + g_margin * 2 + g_caretW; }
 static void ClampScroll(void) {
     if (g_mdView) {
         int mx = g_mdH - g_ch; if (mx < 0) mx = 0;
@@ -1090,8 +1098,8 @@ static void EnsureVisible(void) {
     }
     if (g_wrap) { g_sx = 0; return; }
     CaretInfo(&pt, &L, &r);
-    int x = pt.x + g_sx - g_margin;
-    int w = g_cw - g_margin * 2; if (w < 20) w = 20;
+    int x = pt.x + g_sx - g_gut - g_margin;
+    int w = g_cw - g_gut - g_margin * 2; if (w < 20) w = 20;
     if (x + g_caretW > g_maxW) g_maxW = x + g_caretW;
     if (x < g_sx) g_sx = x - w / 4;
     else if (x + g_caretW > g_sx + w) { g_sx = x + g_caretW - w + w / 4; if (g_sx + w > g_maxW) g_maxW = g_sx + w; }
@@ -1432,11 +1440,14 @@ static void SetupFont(void) {
     if (g_font) DeleteObject(g_font);
     g_font = nf;
     TEXTMETRICW tm; GetTextMetricsW(g_hdcM, &tm);
-    g_lineH = tm.tmHeight + tm.tmExternalLeading; if (g_lineH < 4) g_lineH = 4;
+    g_textH = tm.tmHeight + tm.tmExternalLeading; if (g_textH < 4) g_textH = 4;
+    int lead = (g_textH * 18 + 50) / 100;   /* ~18% extra line spacing, half above and half below the text */
+    g_lineH = g_textH + lead; g_ty = lead / 2;
     g_ascent = tm.tmAscent;
     SIZE sz; GetTextExtentPoint32W(g_hdcM, L"        ", 8, &sz);
     g_avgW = sz.cx / 8; if (g_avgW < 1) g_avgW = 1;
     g_tabW = g_avgW * 4;
+    GetTextExtentPoint32W(g_hdcM, L"0123456789", 10, &sz); g_digitW = (sz.cx + 9) / 10;
     g_margin = Sc(6);
     DWORD cw = 1; SystemParametersInfoW(SPI_GETCARETWIDTH, 0, &cw, 0);
     g_caretW = MulDiv((int)(cw < 1 ? 1 : cw), (int)g_dpi, 96); if (g_caretW < 1) g_caretW = 1;
@@ -1451,6 +1462,7 @@ static void SetupFont(void) {
     g_uiFont = CreateFontIndirectW(&u);
     u.lfHeight = -MulDiv(10, (int)g_dpi, 72);
     g_capFont = CreateFontIndirectW(&u);
+    g_findFontSet = NULL;                   /* FrameLayout hands the new UI font to the find fields */
     if (g_hwnd) { SetImeFont(); CreateCaretNow(); }
     MdInvalidate();
 }
@@ -1608,6 +1620,26 @@ static void DrawRun(HDC dc, int x0, int y, int i, int j) {
     ExtTextOutW(dc, x0, y, 0, NULL, &LB(i), (UINT)(j - i), g_dxb);
 }
 static void MdPaint(HDC dc, int w, int h);
+/* gutter cell of one row (drawn over anything that scrolled under it): the number only on the first
+   row of a logical line, none on wrapped continuation rows */
+static void DrawGutter(HDC dc, int y, size_t num) {
+    FillR(dc, 0, y, g_gut, y + g_lineH, C_FRAME);
+    if (!num) return;
+    WCHAR b[16]; int n = _snwprintf(b, 16, L"%u", (unsigned)num);
+    SIZE sz; GetTextExtentPoint32W(dc, b, n, &sz);
+    SetTextColor(dc, C_WS);
+    ExtTextOutW(dc, g_gut - Sc(6) - sz.cx, y + g_ty, 0, NULL, b, (UINT)n, NULL);
+}
+static int GutterW(void) {
+    if (!g_lineNo || g_mdView) return 0;
+    int d = 1; for (size_t n = g_nl; n >= 10; n /= 10) d++;
+    return (d < 2 ? 2 : d) * g_digitW + Sc(12);
+}
+static void ClampScroll(void);
+static void GutterCheck(void) {     /* the width follows the digit count of the last line number */
+    int w = GutterW();
+    if (w != g_gut) { g_gut = w; g_layoutVer++; g_maxW = 0; g_dirty = TRUE; ClampScroll(); }
+}
 /* draws the text rows whose top lies in [y0, y1) (the caller clips and fills the background) */
 static void PaintRows(HDC dc, int w, int y0, int y1) {
     COLORREF sbg = (g_focus || GetFocus() == NULL) ? C_SEL : C_SEL_NF;
@@ -1653,7 +1685,7 @@ static void PaintRows(HDC dc, int w, int y0, int y1) {
                 while (j < vb && LB(j) != L'\t' && j - i < 2048) j++;
                 if (j < vb && IS_LO(LB(j))) j++;
                 int x0 = LX(i) + ox, x1 = LX(j) + ox;
-                if (x1 >= 0 && x0 <= w) DrawRun(dc, x0, y, i, j);
+                if (x1 >= 0 && x0 <= w) DrawRun(dc, x0, y + g_ty, i, j);
                 i = j;
             }
             if (g_showWs) {
@@ -1661,13 +1693,13 @@ static void PaintRows(HDC dc, int w, int y0, int y1) {
                 if (lastRow && vb == n) {
                     int xe = LX(n) + ox + Sc(2);
                     if (L + 1 < g_nl) DrawNewlineMark(dc, xe, y);
-                    else { SetTextColor(dc, C_WS); ExtTextOutW(dc, xe, y, 0, NULL, L"[EOF]", 5, NULL); }
+                    else { SetTextColor(dc, C_WS); ExtTextOutW(dc, xe, y + g_ty, 0, NULL, L"[EOF]", 5, NULL); }
                 }
             }
             /* composition underlines (per clause x attribute, clipped to this row) */
             if (co >= 0) {
-                int gap = thin, uy = y + g_lineH - 2 * gap;
-                if (uy < y + g_ascent + gap) uy = y + g_ascent + gap;
+                int gap = thin, uy = y + g_ty + g_textH - 2 * gap;
+                if (uy < y + g_ty + g_ascent + gap) uy = y + g_ty + g_ascent + gap;
                 int ci = 0, k = 0;
                 while (k < g_clen) {
                     while (ci + 1 < g_nccl && (int)g_ccl[ci + 1] <= k) ci++;
@@ -1687,13 +1719,14 @@ static void PaintRows(HDC dc, int w, int y0, int y1) {
                     k = m;
                 }
             }
+            if (g_gut) DrawGutter(dc, y, r == 0 ? L + 1 : 0);
         }
         L++; r = 0;
     }
 }
 /* everything the picture depends on, except what Invalidate() reports */
 typedef struct {
-    size_t top, sa, sb, ma, mb; int topRow, sx, cw, ch, mdTop;
+    size_t top, sa, sb, ma, mb; int topRow, sx, cw, ch, mdTop, gut;
     BOOL wrap, ws, md, findOpen, comp, focus;
     unsigned docVer, compVer, layoutVer, findVer; const void *re;
 } ViewKey;
@@ -1701,7 +1734,7 @@ static HDC g_bb; static HBITMAP g_bbBmp; static int g_bbW, g_bbH;
 static ViewKey g_vk;   /* the back buffer shows g_vk unless dirty */
 static void ViewKeyNow(ViewKey *k) {
     memset(k, 0, sizeof *k);
-    k->top = g_top; k->topRow = g_topRow; k->sx = g_sx; k->cw = g_cw; k->ch = g_ch; k->mdTop = g_mdTop;
+    k->top = g_top; k->topRow = g_topRow; k->sx = g_sx; k->cw = g_cw; k->ch = g_ch; k->mdTop = g_mdTop; k->gut = g_gut;
     if (HasSel()) { k->sa = SelA(); k->sb = SelB(); }
     k->ma = g_curMA; k->mb = g_curMB; k->wrap = g_wrap; k->ws = g_showWs; k->md = g_mdView;
     k->findOpen = g_findOpen; k->comp = g_comp; k->focus = g_focus || GetFocus() == NULL;
@@ -1711,7 +1744,7 @@ static void Invalidate(void) { g_dirty = TRUE; if (g_hwnd) InvalidateRect(g_hwnd
 /* no wrap: content width of the visible lines (provisional while a line is not measured to its end) */
 static void UpdateMaxW(void) {
     if (g_wrap || g_mdView) return;
-    int m = g_sx > 0 ? g_sx + g_cw - g_margin * 2 - g_caretW : 0;
+    int m = g_sx > 0 ? g_sx + g_cw - g_gut - g_margin * 2 - g_caretW : 0;
     size_t L = g_top;
     for (int k = 0; k <= VisLines() && L < g_nl; k++, L++) {
         Ln ln = LnOf(L, TRUE);
@@ -1725,6 +1758,7 @@ static void RenderStrip(int y0, int y1) {
     IntersectClipRect(g_bb, 0, y0, g_bbW, y1);
     SelectObject(g_bb, g_font);
     FillR(g_bb, 0, y0, g_bbW, y1, C_BG);
+    if (g_gut) FillR(g_bb, 0, y0, g_gut, y1, C_FRAME);
     SetBkMode(g_bb, TRANSPARENT);
     SetTextAlign(g_bb, TA_TOP | TA_LEFT);
     if (g_mdView) MdPaint(g_bb, g_bbW, g_bbH); else PaintRows(g_bb, g_bbW, y0, y1);
@@ -1741,6 +1775,7 @@ static void Paint(HDC hdc, const RECT *pr) {
         if (g_bbBmp) DeleteObject(g_bbBmp);
         g_bbBmp = nb; g_bbW = w; g_bbH = h; g_dirty = TRUE;
     }
+    GutterCheck();
     ViewKey k; ViewKeyNow(&k);
     if (g_dirty || memcmp(&k, &g_vk, sizeof k)) {
         UpdateMaxW();
@@ -1766,6 +1801,7 @@ static void ScrollView(int d, const ViewKey *k) {
 }
 static void Refresh(BOOL ensure) {
     if (!g_hwnd) return;
+    GutterCheck();
     if (ensure) EnsureVisible();
     UpdateScrollBars();
     ViewKey k; ViewKeyNow(&k);
@@ -1778,6 +1814,7 @@ static void Refresh(BOOL ensure) {
         else InvalidateRect(g_hwnd, NULL, FALSE);
     }
     PlaceCaret();
+    StatusUpdate();
 }
 
 /* ================================================================== */
@@ -1985,6 +2022,68 @@ static void StartReconversion(void) {
 /* ================================================================== */
 /* find / replace on the document                                      */
 /* ================================================================== */
+/* ================================================================== */
+/* Ctrl+Q: resize the window with the keyboard. Only the right and    */
+/* bottom edges move; the top-left corner stays where it is            */
+/* ================================================================== */
+static BOOL g_resize;
+static HWND g_rsWnd; static HIMC g_rsImc;   /* the IME is detached meanwhile, so W/A/S/D arrive as keys */
+static void ResizeEnd(void) {
+    if (!g_resize) return;
+    g_resize = FALSE;
+    if (g_rsWnd && IsWindow(g_rsWnd)) ImmAssociateContext(g_rsWnd, g_rsImc);
+    g_rsWnd = NULL; g_rsImc = NULL;
+    InvalidateCaption();
+}
+static void ResizeBegin(void) {
+    if (g_resize) return;
+    if (IsZoomed(g_frame) || IsIconic(g_frame)) { MessageBeep(MB_OK); return; }
+    HWND f = GetFocus();
+    HIMC imc = f ? ImmGetContext(f) : NULL;
+    if (imc) { ImmNotifyIME(imc, NI_COMPOSITIONSTR, CPS_COMPLETE, 0); ImmReleaseContext(f, imc); }
+    g_resize = TRUE;
+    g_rsWnd = f; g_rsImc = f ? ImmAssociateContext(f, NULL) : NULL;
+    InvalidateCaption();
+}
+static int MinW(void) { return Sc(360); }
+static int MinH(void) { return Sc(200); }
+static void ResizeBy(int dx, int dy) {
+    RECT r, v; GetWindowRect(g_frame, &r);
+    /* visible bounds (without the invisible resize borders) are what must stay inside the work area */
+    if (FAILED(DwmGetWindowAttribute(g_frame, DWMWA_EXTENDED_FRAME_BOUNDS, &v, sizeof v)) || IsRectEmpty(&v)) v = r;
+    MONITORINFO mi; mi.cbSize = sizeof mi;
+    GetMonitorInfoW(MonitorFromWindow(g_frame, MONITOR_DEFAULTTONEAREST), &mi);
+    int w = r.right - r.left, h = r.bottom - r.top, nw = w + dx, nh = h + dy;
+    int maxW = w + (mi.rcWork.right - v.right), maxH = h + (mi.rcWork.bottom - v.bottom);
+    if (dx > 0 && nw > maxW) nw = maxW > w ? maxW : w;     /* grows up to the work area, never beyond */
+    if (dy > 0 && nh > maxH) nh = maxH > h ? maxH : h;
+    if (nw < MinW()) nw = MinW();
+    if (nh < MinH()) nh = MinH();
+    if (nw != w || nh != h) SetWindowPos(g_frame, NULL, 0, 0, nw, nh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+/* a key while resizing: TRUE = consumed. Any other key ends the mode and is processed as usual */
+static BOOL ResizeKey(HWND h, WPARAM vk) {
+    if (!g_resize) return FALSE;
+    if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN || vk == VK_CAPITAL) return FALSE;
+    int st = GetKeyState(VK_SHIFT) < 0 ? Sc(2) : Sc(20), dx = 0, dy = 0;
+    switch (vk) {
+    case VK_RIGHT: case 'D': dx = st; break;
+    case VK_LEFT:  case 'A': dx = -st; break;
+    case VK_DOWN:  case 'S': dy = st; break;
+    case VK_UP:    case 'W': dy = -st; break;
+    case VK_RETURN: case VK_ESCAPE: ResizeEnd(); break;
+    case 'Q': if (GetKeyState(VK_CONTROL) < 0) break;     /* Ctrl+Q held down (auto-repeat) */
+        /* fall through */
+    default: ResizeEnd(); return FALSE;
+    }
+    if (dx || dy) ResizeBy(dx, dy);
+    if (vk >= 'A' && vk <= 'Z') vk = 0;
+    if (vk == 0 || vk == VK_RETURN || vk == VK_ESCAPE) {    /* its WM_CHAR is already queued: drop it */
+        MSG msg; PeekMessageW(&msg, h, WM_CHAR, WM_CHAR, PM_REMOVE);
+    }
+    return TRUE;
+}
+
 static HWND g_edFind, g_edRepl;
 static HBRUSH g_brInput;
 static void SetFindStatus(const WCHAR *s) {
@@ -2011,6 +2110,7 @@ static void FindCompile(void) {
     free(t);
     SetFindStatus(g_reLiteral ? L"正規表現として無効なため文字列として検索します" : L"");
     if (g_hwnd) Invalidate();
+    StatusUpdate();
 }
 static void SelectMatch(size_t a, size_t b) {
     g_anchor = a; g_caret = b; g_aff = FALSE; g_wantX = -1;
@@ -2263,12 +2363,150 @@ static void FindAction(int hit) {
     case H_REPALL: DoReplaceAll(); break;
     }
 }
+/* ---- IME composition in the find / replace fields: drawn here in the field's own colours (the
+   default composition window is black on white) with the same clause underlines as the text view ---- */
+static HWND g_edComp;                       /* field with a composition in progress */
+static int g_edX0, g_edY, g_edUy;           /* geometry of the last composition paint (selftest) */
+static WCHAR EdCharAt(HWND e, DWORD i) {
+    int n = GetWindowTextLengthW(e); WCHAR *t = xmalloc(((size_t)n + 1) * sizeof(WCHAR));
+    GetWindowTextW(e, t, n + 1); WCHAR c = (int)i < n ? t[i] : 0; free(t); return c;
+}
+static void EdCaretReset(HWND e) {          /* back to the field's own caret position */
+    DWORD a = 0, b = 0; SendMessageW(e, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+    LRESULT p = SendMessageW(e, EM_POSFROMCHAR, b, 0);
+    int dx = 0;
+    if (p == -1 && b > 0) {                 /* at the end of the text some versions answer -1 */
+        WCHAR c[2]; int n = b > 1 && IS_LO(EdCharAt(e, b - 1)) ? 2 : 1;
+        c[0] = EdCharAt(e, b - (DWORD)n); c[1] = EdCharAt(e, b - 1);
+        p = SendMessageW(e, EM_POSFROMCHAR, b - (DWORD)n, 0);
+        HDC dc = GetDC(e); HGDIOBJ of = SelectObject(dc, (HFONT)SendMessageW(e, WM_GETFONT, 0, 0));
+        SIZE sz; GetTextExtentPoint32W(dc, c, n, &sz); dx = sz.cx;
+        SelectObject(dc, of); ReleaseDC(e, dc);
+    }
+    if (p != -1) SetCaretPos((short)LOWORD(p) + dx, (short)HIWORD(p));
+}
+static void EdCompPaint(HWND e, HDC hdc) {
+    RECT rc, rf; GetClientRect(e, &rc); SendMessageW(e, EM_GETRECT, 0, (LPARAM)&rf);
+    int w = rc.right, h = rc.bottom; if (w <= 0 || h <= 0) return;
+    int n = GetWindowTextLengthW(e);
+    DWORD sa = 0, sb = 0; SendMessageW(e, EM_GETSEL, (WPARAM)&sa, (LPARAM)&sb);
+    if (sa > (DWORD)n) sa = (DWORD)n;
+    int tn = n + g_clen;                    /* field text with the composition at the caret */
+    WCHAR *t = xmalloc(((size_t)tn + 1) * sizeof(WCHAR));
+    GetWindowTextW(e, t, n + 1);
+    memmove(t + sa + g_clen, t + sa, (size_t)(n - (int)sa) * sizeof(WCHAR));
+    memcpy(t + sa, g_cstr, (size_t)g_clen * sizeof(WCHAR));
+    int *px = xmalloc(((size_t)tn + 1) * sizeof(int));     /* px[i] = width of t[0, i) */
+    HDC dc = CreateCompatibleDC(hdc);
+    HBITMAP bm = CreateCompatibleBitmap(hdc, w, h);
+    HGDIOBJ ob = SelectObject(dc, bm), of = SelectObject(dc, (HFONT)SendMessageW(e, WM_GETFONT, 0, 0));
+    TEXTMETRICW tm; GetTextMetricsW(dc, &tm);
+    SIZE sz; px[0] = 0;
+    if (tn > 0) GetTextExtentExPointW(dc, t, tn, 0, NULL, px + 1, &sz);
+    /* where the field draws its first character; scrolled so the composition cursor stays visible */
+    LRESULT p0 = n > 0 ? SendMessageW(e, EM_POSFROMCHAR, 0, 0) : -1;
+    int x0 = p0 != -1 ? (short)LOWORD(p0) : rf.left, y = p0 != -1 ? (short)HIWORD(p0) : rf.top, right = rf.right - 1;
+    int cs = px[sa], cc = px[sa + (DWORD)g_ccur];
+    if (x0 + px[tn] < right) x0 = right - px[tn];
+    if (x0 > rf.left) x0 = rf.left;
+    if (x0 + cs < rf.left) x0 = rf.left - cs;
+    if (x0 + cc > right) x0 = right - cc;
+    FillR(dc, 0, 0, w, h, C_INPUT_BG);
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, C_INPUT_TX);
+    ExtTextOutW(dc, x0, y, 0, NULL, t, (UINT)tn, NULL);
+    int gap = Sc(1) < 1 ? 1 : Sc(1), uy = y + tm.tmHeight - 2 * gap;
+    if (uy < y + tm.tmAscent + gap) uy = y + tm.tmAscent + gap;
+    for (int k = 0, ci = 0; k < g_clen;) {  /* one underline per clause x attribute run */
+        while (ci + 1 < g_nccl && (int)g_ccl[ci + 1] <= k) ci++;
+        int cend = (ci + 1 < g_nccl) ? (int)g_ccl[ci + 1] : g_clen;
+        if (cend > g_clen || cend <= k) cend = g_clen;
+        BYTE at = g_cattr[k];
+        int m = k + 1;
+        while (m < cend && g_cattr[m] == at) m++;
+        int a = x0 + px[sa + (DWORD)k] + gap, b = x0 + px[sa + (DWORD)m] - gap;
+        DrawUnderline(dc, a, b > a ? b : a + 1, uy, at, at == ATTR_INPUT_ERROR ? RGB(255, 80, 80) : C_INPUT_TX);
+        k = m;
+    }
+    BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, of); SelectObject(dc, ob); DeleteObject(bm); DeleteDC(dc);
+    g_edX0 = x0; g_edY = y; g_edUy = uy;
+    SetCaretPos(x0 + cc, y);
+    HIMC imc = ImmGetContext(e);
+    if (imc) {
+        int ta, tb; CompTarget(&ta, &tb);
+        COMPOSITIONFORM cf; memset(&cf, 0, sizeof cf);
+        cf.dwStyle = CFS_POINT; cf.ptCurrentPos.x = x0 + cs; cf.ptCurrentPos.y = y;
+        ImmSetCompositionWindow(imc, &cf);
+        CANDIDATEFORM cd; memset(&cd, 0, sizeof cd);
+        int xa = x0 + px[sa + (DWORD)ta], xb = x0 + px[sa + (DWORD)tb];
+        cd.dwStyle = CFS_EXCLUDE; cd.ptCurrentPos.x = xa; cd.ptCurrentPos.y = y;
+        SetRect(&cd.rcArea, xa, y, xb > xa ? xb : xa + 1, y + tm.tmHeight);
+        ImmSetCandidateWindow(imc, &cd);
+        ImmReleaseContext(e, imc);
+    }
+    free(t); free(px);
+}
+static void EdCompRefresh(HWND e) {
+    InvalidateRect(e, NULL, TRUE); UpdateWindow(e);
+    if (g_clen == 0) EdCaretReset(e);
+}
+static void EdComposition(HWND e, LPARAM lp) {
+    HIMC imc = ImmGetContext(e);
+    if (!imc) return;
+    if (lp & GCS_RESULTSTR) {
+        LONG nb = ImmGetCompositionStringW(imc, GCS_RESULTSTR, NULL, 0);
+        if (nb > 0) {
+            WCHAR *r = xmalloc((size_t)nb + sizeof(WCHAR));
+            nb = ImmGetCompositionStringW(imc, GCS_RESULTSTR, r, (DWORD)nb);
+            int k = 0;
+            for (int i = 0; i < (int)(nb / (LONG)sizeof(WCHAR)); i++) if (r[i] != L'\r' && r[i] != L'\n') r[k++] = r[i];
+            r[k] = 0;
+            if (k) SendMessageW(e, EM_REPLACESEL, TRUE, (LPARAM)r);
+            free(r);
+        }
+    }
+    ReadCompString(imc, lp);
+    ImmReleaseContext(e, imc);
+    g_edComp = e;
+    EdCompRefresh(e);
+}
+static void EdEndComposition(HWND e) {
+    g_edComp = NULL; ClearComp();
+    EdCompRefresh(e);
+}
 static LRESULT CALLBACK EditSubProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
     (void)ref;
     BOOL ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
     switch (m) {
     case WM_SETFOCUS: g_lastFocus = h; break;
+    case WM_KILLFOCUS:
+        ResizeEnd();
+        if (g_edComp == h) { HIMC imc = ImmGetContext(h); if (imc) { ImmNotifyIME(imc, NI_COMPOSITIONSTR, CPS_COMPLETE, 0); ImmReleaseContext(h, imc); } }
+        break;
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: ResizeEnd(); break;
+    case WM_SYSKEYDOWN: ResizeEnd(); break;
+    case WM_PAINT:
+        if (g_edComp == h && g_clen > 0) { PAINTSTRUCT ps; HDC d = BeginPaint(h, &ps); EdCompPaint(h, d); EndPaint(h, &ps); return 0; }
+        break;
+    case WM_IME_SETCONTEXT:
+        if (wp) lp &= ~(LPARAM)ISC_SHOWUICOMPOSITIONWINDOW;    /* we draw the composition */
+        break;
+    case WM_IME_STARTCOMPOSITION: {
+        DWORD a = 0, b = 0; SendMessageW(h, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+        if (a != b) SendMessageW(h, EM_REPLACESEL, TRUE, (LPARAM)L"");
+        ClearComp(); g_edComp = h;
+        return 0;
+    }
+    case WM_IME_COMPOSITION: EdComposition(h, lp); return 0;   /* not to EDIT: no WM_IME_CHAR duplicates */
+    case WM_IME_ENDCOMPOSITION: EdEndComposition(h); return 0;
+    case WM_IME_CHAR: return 0;
+    case WM_IME_NOTIFY:
+        if (g_edComp == h && g_clen > 0 && (wp == IMN_OPENCANDIDATE || wp == IMN_CHANGECANDIDATE)) EdCompRefresh(h);
+        break;
     case WM_KEYDOWN:
+        if (ResizeKey(h, wp)) return 0;
+        if (ctrl && !alt && wp == 'Q') { ResizeBegin(); return 0; }
+        if (ctrl && !alt && wp == 'L') { DoCommand(IDM_LINENO); return 0; }
         if (wp == VK_RETURN) { if (id == 2) DoReplace(); else FindNext(!shift); return 0; }
         if (wp == VK_ESCAPE) { FindHide(); return 0; }
         if (wp == VK_F3) { FindNext(!shift); return 0; }
@@ -2311,7 +2549,7 @@ static LRESULT CALLBACK FindProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSELEAVE: g_fHover = H_NONE; g_fPress = H_NONE; InvalidateRect(h, NULL, FALSE); return 0;
-    case WM_LBUTTONDOWN: g_fPress = FindHit(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); SetCapture(h); InvalidateRect(h, NULL, FALSE); return 0;
+    case WM_LBUTTONDOWN: ResizeEnd(); g_fPress = FindHit(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); SetCapture(h); InvalidateRect(h, NULL, FALSE); return 0;
     case WM_LBUTTONUP: {
         int hit = FindHit(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)), p = g_fPress;
         g_fPress = H_NONE; ReleaseCapture(); InvalidateRect(h, NULL, FALSE);
@@ -2323,6 +2561,93 @@ static LRESULT CALLBACK FindProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         break;
     }
     return DefWindowProcW(h, m, wp, lp);
+}
+/* ================================================================== */
+/* status bar while the find popup is open: caret position and the    */
+/* match count, counted in idle time for big documents                 */
+/* ================================================================== */
+#define MC_MAX 1000000                      /* match starts kept for the "k / N" index */
+static struct { unsigned docVer, findVer; size_t L, n, cap; size_t *pos; BOOL valid, done; } g_mc;
+static WCHAR g_sbText[160];
+static void McSync(void) {                  /* restart when the document or the pattern changed */
+    if (g_mc.valid && g_mc.docVer == g_docVer && g_mc.findVer == g_findVer) return;
+    g_mc.valid = TRUE; g_mc.docVer = g_docVer; g_mc.findVer = g_findVer;
+    g_mc.L = 0; g_mc.n = 0; g_mc.done = g_re == NULL;
+}
+/* counts line by line with FindFrom's rules (non-empty matches, no overlap); TRUE while not done */
+static BOOL McStep(double t0) {
+    McSync();
+    int caps[2 * RE_NCAP];
+    while (!g_mc.done) {
+        if (g_mc.L >= g_nl) { g_mc.done = TRUE; break; }
+        size_t L = g_mc.L++, base = LineStart(L);
+        int n, s = 0; const WCHAR *t = LineText(L, &n);
+        while (s <= n && re_search(g_re, (const rechar *)t, n, s, caps)) {
+            if (caps[1] > caps[0]) {
+                if (g_mc.n < MC_MAX) {
+                    if (g_mc.n == g_mc.cap) { g_mc.cap = g_mc.cap ? g_mc.cap * 2 : 1024; g_mc.pos = xrealloc(g_mc.pos, g_mc.cap * sizeof(size_t)); }
+                    g_mc.pos[g_mc.n] = base + (size_t)caps[0];
+                }
+                g_mc.n++; s = caps[1];
+            } else s = caps[0] + 1;
+        }
+        if ((g_mc.L & 15) == 0 && IdleBusy(t0)) break;
+    }
+    return !g_mc.done;
+}
+/* 1-based index of the selected match; 0 = the selection is not a counted match, -1 = not counted yet */
+static long long McIndex(void) {
+    if (!HasSel() || SelA() != g_curMA || SelB() != g_curMB) return 0;
+    size_t a = SelA(), kept = g_mc.n < MC_MAX ? g_mc.n : MC_MAX, lo = 0, hi = kept;
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_mc.pos[mid] < a) lo = mid + 1; else hi = mid; }
+    if (lo < kept && g_mc.pos[lo] == a) return (long long)lo + 1;
+    return (!g_mc.done && g_mc.n <= MC_MAX && LineOf(a) >= g_mc.L) ? -1 : 0;
+}
+static void StatusText(WCHAR *b, int cap) {
+    size_t L = LineOf(g_caret), s = LineStart(L), col = 1;
+    WCHAR tmp[4096];
+    if (g_caret - s > 1000000) col += g_caret - s;   /* giant line: UTF-16 units, no full scan per keystroke */
+    else for (size_t i = s; i < g_caret;) {          /* column in code points */
+        size_t k = g_caret - i < 4096 ? g_caret - i : 4096;
+        DocGet(i, k, tmp);
+        for (size_t j = 0; j < k; j++) col += !IS_LO(tmp[j]);
+        i += k;
+    }
+    int o = _snwprintf(b, (size_t)cap, L"行 %u, 列 %u", (unsigned)(L + 1), (unsigned)col);
+    if (o < 0) o = 0;
+    b[o] = 0;
+    if (!g_re) return;
+    McSync();
+    long long ix = McIndex();
+    WCHAR m[64];
+    if (g_mc.done && g_mc.n == 0) wcscpy(m, L"一致なし");
+    else if (g_mc.done) { if (ix > 0) _snwprintf(m, 64, L"%u / %u 件", (unsigned)ix, (unsigned)g_mc.n); else _snwprintf(m, 64, L"%u 件", (unsigned)g_mc.n); }
+    else if (ix > 0) _snwprintf(m, 64, L"%u / … 件", (unsigned)ix);
+    else wcscpy(m, L"… 件");
+    m[63] = 0;
+    _snwprintf(b + o, (size_t)(cap - o), L"\t%ls", m);
+    b[cap - 1] = 0;
+}
+static int CapH(void);
+static int StatusH(void) { return g_findOpen ? Sc(22) : 0; }
+static void StatusRect(RECT *r) { GetClientRect(g_frame, r); r->top = r->bottom - StatusH(); }
+static void StatusUpdate(void) {
+    if (!g_findOpen || !g_frame) return;
+    WCHAR b[160]; StatusText(b, 160);
+    if (wcscmp(b, g_sbText)) { wcscpy(g_sbText, b); RECT r; StatusRect(&r); InvalidateRect(g_frame, &r, FALSE); }
+}
+static void StatusPaint(HDC hdc) {
+    RECT r; StatusRect(&r);
+    if (r.bottom <= r.top) return;
+    StatusText(g_sbText, 160);
+    FillR(hdc, r.left, r.top, r.right, r.bottom, C_FRAME);
+    HGDIOBJ of = SelectObject(hdc, g_uiFont);
+    SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, C_CAPTEXT);
+    WCHAR *tab = wcschr(g_sbText, L'\t');
+    RECT a = r; a.left += Sc(10); a.right -= Sc(10);
+    DrawTextW(hdc, g_sbText, tab ? (int)(tab - g_sbText) : -1, &a, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+    if (tab) DrawTextW(hdc, tab + 1, -1, &a, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+    SelectObject(hdc, of);
 }
 static void FindShow(BOOL expanded) {
     CompleteComposition();
@@ -2345,6 +2670,7 @@ static void FindHide(void) {
     SetFindStatus(L"");
     SetFocus(g_hwnd);
     Invalidate();
+    free(g_mc.pos); memset(&g_mc, 0, sizeof g_mc); g_sbText[0] = 0;
 }
 
 /* ================================================================== */
@@ -2910,6 +3236,7 @@ static void DoCommand(int id) {
         g_wrap = !g_wrap; g_layoutVer++; g_topRow = 0; g_sx = 0; g_aff = FALSE; g_maxW = 0;
         Refresh(TRUE); break;
     case IDM_WS: g_showWs = !g_showWs; Refresh(FALSE); break;
+    case IDM_LINENO: g_lineNo = !g_lineNo; Refresh(TRUE); break;
     case IDM_MD: SetMdView(!g_mdView); break;
     case IDM_ZOOMIN: ZoomSet(g_fontPt10 + 10); break;
     case IDM_ZOOMOUT: ZoomSet(g_fontPt10 - 10); break;
@@ -2973,6 +3300,8 @@ static void OnKeyDown(WPARAM vk) {
         case 'M': cmd = IDM_MD; break;
         case 'T': cmd = IDM_WRAP; break;
         case 'W': cmd = IDM_WS; break;
+        case 'L': cmd = IDM_LINENO; break;
+        case 'Q': ResizeBegin(); return;
         case 'A': cmd = IDM_SELALL; break;
         case 'C': cmd = IDM_COPY; break;
         case 'X': cmd = IDM_CUT; break;
@@ -3172,6 +3501,7 @@ static LRESULT CALLBACK TextProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         g_focus = TRUE; g_lastFocus = h; CreateCaretNow(); PlaceCaret(); Invalidate();
         return 0;
     case WM_KILLFOCUS:
+        ResizeEnd();
         CompleteComposition();              /* EDIT commits the composition on focus loss */
         g_focus = FALSE;
         if (g_caretMade) { DestroyCaret(); g_caretMade = FALSE; }
@@ -3186,9 +3516,11 @@ static LRESULT CALLBACK TextProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         break;
     case WM_KEYDOWN:
         if (wp == VK_PROCESSKEY) break;     /* consumed by the IME */
+        if (ResizeKey(h, wp)) return 0;
         OnKeyDown(wp);
         return 0;
     case WM_SYSKEYDOWN:
+        ResizeEnd();
         if (wp == VK_F4) { PostMessageW(g_frame, WM_SYSCOMMAND, SC_CLOSE, 0); return 0; }
         break;
     case WM_SYSCHAR:
@@ -3234,6 +3566,7 @@ static LRESULT CALLBACK TextProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     /* ---- mouse ---- */
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
+        ResizeEnd();
         CompleteComposition();              /* EDIT commits the composition on click */
         if (GetFocus() != h) SetFocus(h);
         if (g_mdView) return 0;
@@ -3279,7 +3612,8 @@ static LRESULT CALLBACK TextProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_CAPTURECHANGED:
         g_dragging = FALSE; KillTimer(h, 1);
         return 0;
-    case WM_RBUTTONDOWN:
+    case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:
+        ResizeEnd();
         CompleteComposition();
         if (GetFocus() != h) SetFocus(h);
         return 0;
@@ -3335,6 +3669,7 @@ static void IniReadFrom(const WCHAR *p) {
     if (g_fontPt10 < 60 || g_fontPt10 > 720) g_fontPt10 = 110;
     g_wrap = GetPrivateProfileIntW(L"Editor", L"Wrap", g_wrap, p) != 0;
     g_showWs = GetPrivateProfileIntW(L"Editor", L"Whitespace", g_showWs, p) != 0;
+    g_lineNo = GetPrivateProfileIntW(L"Editor", L"LineNumbers", g_lineNo, p) != 0;
     g_matchCase = GetPrivateProfileIntW(L"Find", L"MatchCase", g_matchCase, p) != 0;
     if (GetPrivateProfileStringW(L"Window", L"W", L"", b, 32, p) > 0) {
         int x = (int)GetPrivateProfileIntW(L"Window", L"X", 0, p), y = (int)GetPrivateProfileIntW(L"Window", L"Y", 0, p);
@@ -3364,6 +3699,7 @@ static BOOL IniWriteTo(const WCHAR *p) {
     IniPut(L"Editor", L"Zoom", g_fontPt10, p);
     IniPut(L"Editor", L"Wrap", g_wrap, p);
     IniPut(L"Editor", L"Whitespace", g_showWs, p);
+    IniPut(L"Editor", L"LineNumbers", g_lineNo, p);
     IniPut(L"Find", L"MatchCase", g_matchCase, p);
     if (g_frame) {
         WINDOWPLACEMENT wp = { sizeof wp, 0, 0, { 0, 0 }, { 0, 0 }, { 0, 0, 0, 0 } };
@@ -3398,6 +3734,7 @@ static BOOL g_active = TRUE;
 static int g_capHot, g_capDown;             /* HTMINBUTTON / HTMAXBUTTON / HTCLOSE / CAP_MENU */
 #define CAP_MENU 1000
 static int CapH(void) { return Sc(32); }
+static int GapH(void) { return Sc(6); }     /* space between the title bar and the first line */
 static COLORREF FrameColor(void) { return g_mdView ? C_FRAME_MD : C_FRAME; }
 static void CapRects(RECT *rmin, RECT *rmax, RECT *rclose, RECT *rmenu) {
     RECT rc; GetClientRect(g_frame, &rc);
@@ -3478,6 +3815,7 @@ static void FramePaint(HWND h) {
         }
         WCHAR title[MAX_PATH * 4 + 32]; GetWindowTextW(h, title, sizeof title / sizeof title[0]);
         if (g_mdView) wcscat(title, L"  [Markdown]");
+        if (g_resize) wcscpy(title, L"サイズ変更: 矢印/WASD, Enter/Esc で終了  (Shift: 細かく)");
         HGDIOBJ of = SelectObject(dc, g_capFont);
         SetBkMode(dc, TRANSPARENT); SetTextColor(dc, fg);
         RECT tr = { Sc(30), 0, rmenu.left - Sc(8), ch };
@@ -3487,15 +3825,17 @@ static void FramePaint(HWND h) {
         SelectObject(dc, ob); DeleteObject(bmp); DeleteDC(dc);
     }
     if (rc.bottom > ch && !g_hwnd) FillR(hdc, 0, ch, w, rc.bottom, C_BG);
+    else if (g_hwnd) { FillR(hdc, 0, ch, w, ch + GapH(), C_BG); StatusPaint(hdc); }
     EndPaint(h, &ps);
 }
-static HFONT g_findFontSet;
 static void FrameLayout(void) {
     if (!g_frame || !g_hwnd) return;
     RECT rc; GetClientRect(g_frame, &rc);
-    int ch = CapH();
-    int h = rc.bottom - ch; if (h < 0) h = 0;
-    SetWindowPos(g_hwnd, NULL, 0, ch, rc.right, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    int ch = CapH(), top = ch + GapH();
+    int h = rc.bottom - top - StatusH(); if (h < 0) h = 0;
+    SetWindowPos(g_hwnd, NULL, 0, top, rc.right, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    RECT g = { 0, ch, rc.right, top }; InvalidateRect(g_frame, &g, FALSE);
+    if (StatusH()) { StatusRect(&g); InvalidateRect(g_frame, &g, FALSE); }
     if (g_find) {
         if (g_findFontSet != g_uiFont) {
             SendMessageW(g_edFind, WM_SETFONT, (WPARAM)g_uiFont, TRUE);
@@ -3568,6 +3908,7 @@ static void ShowMainMenu(void) {
     AppendMenuW(e, MF_STRING, IDM_FINDPREV, L"前を検索(&B)\tShift+F3");
     AppendMenuW(v, MF_STRING | (g_wrap ? MF_CHECKED : 0), IDM_WRAP, L"右端で折り返す(&W)\tCtrl+T");
     AppendMenuW(v, MF_STRING | (g_showWs ? MF_CHECKED : 0), IDM_WS, L"空白文字を表示(&S)\tCtrl+W");
+    AppendMenuW(v, MF_STRING | (g_lineNo ? MF_CHECKED : 0), IDM_LINENO, L"行番号(&L)\tCtrl+L");
     AppendMenuW(v, MF_STRING | (g_mdView ? MF_CHECKED : 0), IDM_MD, L"Markdown 表示(&M)\tCtrl+M");
     AppendMenuW(v, MF_SEPARATOR, 0, NULL);
     AppendMenuW(v, MF_STRING, IDM_ZOOMIN, L"拡大(&I)\tCtrl+;");
@@ -3653,6 +3994,7 @@ static LRESULT CALLBACK FrameProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (g_capHot != CAP_MENU || !g_capDown) { g_capHot = 0; g_capDown = 0; InvalidateCaption(); }
         break;
     case WM_NCLBUTTONDOWN:
+        ResizeEnd();
         if (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) { CompleteComposition(); g_capDown = (int)wp; g_capHot = (int)wp; InvalidateCaption(); return 0; }
         CompleteComposition();
         break;
@@ -3715,6 +4057,7 @@ static LRESULT CALLBACK FrameProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE) ResizeEnd();
         if (LOWORD(wp) != WA_INACTIVE) {
             HWND f = (g_lastFocus && IsWindowVisible(g_lastFocus)) ? g_lastFocus : g_hwnd;
             SetFocus(f);
@@ -3816,15 +4159,16 @@ static char *ReadAll(const WCHAR *p, size_t *n) {
     ReadFile(f, b, sz, &rd, NULL); CloseHandle(f); *n = rd; return b;
 }
 static double NowMs(void);
-static void SetComp(const WCHAR *comp) {
-    BeginComp();
+static void FillTestComp(const WCHAR *comp) {   /* clauses: [0,2) target, [2,5) converted, rest input; cursor 2 */
+    ClearComp();
     g_clen = (int)wcslen(comp);
     g_cstr = xrealloc(g_cstr, (size_t)(g_clen + 1) * sizeof(WCHAR)); memcpy(g_cstr, comp, (size_t)g_clen * sizeof(WCHAR));
     g_cattr = xrealloc(g_cattr, (size_t)g_clen + 1);
     for (int i = 0; i < g_clen; i++) g_cattr[i] = i < 2 ? ATTR_TARGET_CONVERTED : (i < 5 ? ATTR_CONVERTED : ATTR_INPUT);
     g_ccl = xrealloc(g_ccl, 4 * sizeof(DWORD)); g_ccl[0] = 0; g_ccl[1] = 2; g_ccl[2] = 5; g_ccl[3] = (DWORD)g_clen; g_nccl = 4;
-    g_ccur = 2; g_cpos = g_caret; g_compVer++;
+    g_ccur = 2; g_compVer++;
 }
+static void SetComp(const WCHAR *comp) { BeginComp(); FillTestComp(comp); g_cpos = g_caret; }
 static int MdVisible(const WCHAR *src, WCHAR *vis, WORD *st, int cap) {
     MdOut o; memset(&o, 0, sizeof o);
     MdInline(src, (int)wcslen(src), 0, &o);
@@ -3891,7 +4235,7 @@ static void STComp(const char *tag) {
     snprintf(buf, sizeof buf, "%scomposition end x=%d vs reference width=%d (underline ends here)", tag, endx, full);
     STCheck(abs(endx - full) <= 1, buf);
     POINT cp; GetCaretPos(&cp);
-    int expect = g_margin + PrefixW(t, co + 2);
+    int expect = g_gut + g_margin + PrefixW(t, co + 2);
     snprintf(buf, sizeof buf, "%scaret in composition (GCS_CURSORPOS=2): x=%ld expected=%d", tag, cp.x, expect);
     STCheck(labs(cp.x - expect) <= 1, buf);
     int maxd = 0;
@@ -3899,18 +4243,306 @@ static void STComp(const char *tag) {
         IMECHARPOSITION ip; memset(&ip, 0, sizeof ip); ip.dwSize = sizeof ip; ip.dwCharPos = (DWORD)k;
         OnImeRequest(IMR_QUERYCHARPOSITION, (LPARAM)&ip);
         POINT p = ip.pt; ScreenToClient(g_hwnd, &p);
-        int e = g_margin + PrefixW(t, co + k);
+        int e = g_gut + g_margin + PrefixW(t, co + k);
         int d = abs(p.x - e); if (d > maxd) maxd = d;
     }
     snprintf(buf, sizeof buf, "%sIMR_QUERYCHARPOSITION max diff=%dpx", tag, maxd);
     STCheck(maxd <= 1, buf);
     CANDIDATEFORM cf; memset(&cf, 0, sizeof cf);
     OnImeRequest(IMR_CANDIDATEWINDOW, (LPARAM)&cf);
-    expect = g_margin + PrefixW(t, co);
+    expect = g_gut + g_margin + PrefixW(t, co);
     snprintf(buf, sizeof buf, "%scandidate CFS_EXCLUDE rect=(%ld,%ld)-(%ld,%ld), target clause starts at x=%d", tag,
              cf.rcArea.left, cf.rcArea.top, cf.rcArea.right, cf.rcArea.bottom, expect);
-    STCheck(labs(cf.rcArea.left - expect) <= 1 && labs(cf.rcArea.right - (g_margin + PrefixW(t, co + 2))) <= 1, buf);
+    STCheck(labs(cf.rcArea.left - expect) <= 1 && labs(cf.rcArea.right - (g_gut + g_margin + PrefixW(t, co + 2))) <= 1, buf);
     g_comp = FALSE; ClearComp();
+}
+/* ---- v1.4 selftests ---- */
+static DWORD PxOf(COLORREF c) { return ((DWORD)GetRValue(c) << 16) | ((DWORD)GetGValue(c) << 8) | GetBValue(c); }
+static void SetKey(int vk, BOOL down) { BYTE ks[256]; GetKeyboardState(ks); ks[vk] = down ? 0x80 : 0; SetKeyboardState(ks); }
+static void Pump(void) { MSG m; while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); } }
+/* a key press as the message loop sees it (TranslateMessage queues its WM_CHAR) */
+static void PressKey(HWND h, UINT vk) {
+    PostMessageW(h, WM_KEYDOWN, vk, 1 | ((LPARAM)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16));
+    Pump();
+}
+static DWORD *GrabWnd(HWND h, int *w, int *hh) {
+    RECT rc; GetClientRect(h, &rc); *w = rc.right; *hh = rc.bottom;
+    BITMAPINFO bi; memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = *w; bi.bmiHeader.biHeight = -*hh;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    DWORD *px; HDC dc = CreateCompatibleDC(NULL);
+    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+    HGDIOBJ ob = SelectObject(dc, bm);
+    HDC src = GetDC(h); BitBlt(dc, 0, 0, *w, *hh, src, 0, 0, SRCCOPY); GdiFlush(); ReleaseDC(h, src);
+    DWORD *out = xmalloc((size_t)*w * *hh * sizeof(DWORD)); memcpy(out, px, (size_t)*w * *hh * sizeof(DWORD));
+    SelectObject(dc, ob); DeleteObject(bm); DeleteDC(dc);
+    return out;
+}
+/* IME composition drawn inside the find field */
+static void STEdComp(const char *tag) {
+    char buf[512];
+    FindShow(FALSE);
+    SetWindowTextW(g_edFind, L"検索abc"); SendMessageW(g_edFind, EM_SETSEL, 5, 5);
+    UpdateWindow(g_find);
+    FillTestComp(L"長井文章をへんかん");
+    g_edComp = g_edFind; EdCompRefresh(g_edFind);
+    int w, h; DWORD *px = GrabWnd(g_edFind, &w, &h);
+    int white = 0, bg = 0, red = 0;
+    for (int k = 0; k < w * h; k++) {
+        DWORD c = px[k] & 0xFFFFFF; int r = (int)(c >> 16), g = (int)((c >> 8) & 255);
+        white += c == 0xFFFFFF; bg += c == PxOf(C_INPUT_BG); red += r > 0x70 && r > g + 0x30;
+    }
+    snprintf(buf, sizeof buf, "%sfind field composition: %dx%d px, white=%d, field background=%d%%, text-coloured=%d", tag, w, h, white, bg * 100 / (w * h), red);
+    STCheck(white == 0 && bg * 2 > w * h && red > 20, buf);
+    HDC m = CreateCompatibleDC(NULL); HGDIOBJ of = SelectObject(m, (HFONT)SendMessageW(g_edFind, WM_GETFONT, 0, 0));
+    static const WCHAR full[] = L"検索abc長井文章をへんかん";
+    int W[16]; for (int k = 0; k < 16; k++) { SIZE sz; GetTextExtentPoint32W(m, full, k, &sz); W[k] = sz.cx; }
+    TEXTMETRICW tm; GetTextMetricsW(m, &tm);
+    SelectObject(m, of); DeleteDC(m);
+    int gap = Sc(1) < 1 ? 1 : Sc(1), uy = g_edUy, ok = 0, all = 0;
+    int xa = g_edX0 + W[5] + gap, xb = g_edX0 + W[7] - gap, xc = g_edX0 + W[7] + gap, xd = g_edX0 + W[10] - gap;
+    for (int x = xa; x < xb; x++) { all += 2; ok += px[uy * w + x] == PxOf(C_INPUT_TX); ok += px[(uy - gap) * w + x] == PxOf(C_INPUT_TX); }
+    for (int x = xc; x < xd; x++) { all++; ok += px[uy * w + x] == PxOf(C_INPUT_TX); }
+    snprintf(buf, sizeof buf, "%sclause underlines in the field colour: %d/%d px (thick target x=%d..%d, thin x=%d..%d, y=%d, text y=%d asc=%d h=%d)",
+             tag, ok, all, xa, xb, xc, xd, uy, g_edY, (int)tm.tmAscent, (int)tm.tmHeight);
+    STCheck(all > 20 && ok == all && uy >= g_edY + tm.tmAscent && uy < g_edY + tm.tmHeight && xd < w, buf);
+    POINT cp; GetCaretPos(&cp);
+    LRESULT p0 = SendMessageW(g_edFind, EM_POSFROMCHAR, 0, 0);
+    snprintf(buf, sizeof buf, "%scaret in the field composition: x=%ld y=%ld expected x=%d (text starts at %d, field at %d)", tag, cp.x, cp.y, g_edX0 + W[7], g_edX0, (short)LOWORD(p0));
+    STCheck(cp.x == g_edX0 + W[7] && cp.y == g_edY && g_edX0 == (short)LOWORD(p0), buf);
+    free(px);
+    g_edComp = NULL; ClearComp(); EdCompRefresh(g_edFind);
+    GetCaretPos(&cp); LRESULT p5 = SendMessageW(g_edFind, EM_POSFROMCHAR, 5, 0);
+    if (p5 == -1) p5 = MAKELONG((WORD)(g_edX0 + W[5]), 0);     /* end of text: just after 'c' */
+    WCHAR t[32]; GetWindowTextW(g_edFind, t, 32);
+    snprintf(buf, sizeof buf, "%send of composition: field text \"%s\" unchanged, caret back at x=%ld (field says %d)", tag, W2U(t), cp.x, (short)LOWORD(p5));
+    STCheck(!wcscmp(t, L"検索abc") && cp.x == (short)LOWORD(p5), buf);
+    SetWindowTextW(g_edFind, L""); FindHide();
+}
+static int GutterInk(const DWORD *px, int y0, int y1, int *maxG) {   /* non-gutter-colour pixels in the gutter */
+    int n = 0;
+    for (int y = y0; y < y1 && y < g_ch; y++)
+        for (int x = 0; x < g_gut; x++) {
+            DWORD c = px[y * g_cw + x] & 0xFFFFFF;
+            if (c != PxOf(C_FRAME)) { n++; if (maxG && (int)((c >> 8) & 255) > *maxG) *maxG = (int)((c >> 8) & 255); }
+        }
+    return n;
+}
+static void ST14(char *buf) {
+    const size_t B = 512;
+    /* ---- 12. line-number gutter (Ctrl+L) ---- */
+    g_wrap = FALSE; g_layoutVer++;
+    SetTextForTest(L"テスト\n2\n3");
+    SetKey(VK_CONTROL, TRUE); OnKeyDown('L'); SetKey(VK_CONTROL, FALSE);
+    int g2 = 2 * g_digitW + Sc(12);
+    snprintf(buf, B, "Ctrl+L: line numbers=%d, gutter %dpx (2 digits -> %d)", g_lineNo, g_gut, g2);
+    STCheck(g_lineNo && g_gut == g2, buf);
+    {
+        g_caret = g_anchor = 3; OnKeyDown(VK_LEFT);
+        POINT cp; GetCaretPos(&cp);
+        int expect = g_gut + g_margin + PrefixW(L"テスト", 2);
+        size_t hp = PosFromPoint(expect + 1, g_lineH / 2), hg = PosFromPoint(1, g_lineH + g_lineH / 2);
+        snprintf(buf, B, "gutter: caret x=%ld expected %d; hit test x=%d -> %u (2); click in the gutter on line 2 -> %u (%u)",
+                 cp.x, expect, expect + 1, (unsigned)hp, (unsigned)hg, (unsigned)LineStart(1));
+        STCheck(labs(cp.x - expect) <= 1 && g_caret == 2 && hp == 2 && hg == LineStart(1), buf);
+    }
+    STComp("[gutter] ");
+    {
+        WCHAR *t = xmalloc(4000 * sizeof(WCHAR)); int n = 0;
+        for (int i = 0; i < 120; i++) { t[n++] = L'行'; t[n++] = L'\n'; }
+        t[n - 1] = 0;
+        SetTextForTest(t); free(t);
+        snprintf(buf, B, "gutter follows the digit count: 120 lines -> %dpx (3 digits -> %d)", g_gut, 3 * g_digitW + Sc(12));
+        STCheck(g_gut == 3 * g_digitW + Sc(12), buf);
+    }
+    {   /* wrap: numbers only on the first row of each logical line; wrap width without the gutter */
+        WCHAR t[512]; int n = 0;
+        for (int i = 0; i < 300; i++) t[n++] = (i % 7 == 6) ? L' ' : L'あ';
+        wcscpy(t + n, L"\n二行目\n三");
+        g_wrap = TRUE; g_layoutVer++;
+        SetTextForTest(t);
+        LayoutLine(0, FALSE);
+        int rows = EnsureRows(&g_ln, INT_MAX), worst = 0;
+        for (int r = 0; r < rows; r++) { int w = XOf(&g_ln, RowEnd(r)) - XOf(&g_ln, RowStart(r)); if (w > worst) worst = w; }
+        Invalidate(); UpdateWindow(g_hwnd);
+        DWORD *px = Grab(FALSE);
+        int maxG = 0, ink0 = GutterInk(px, 0, g_lineH, &maxG), inkC = GutterInk(px, g_lineH, rows * g_lineH, &maxG);
+        int ink1 = GutterInk(px, rows * g_lineH, (rows + 1) * g_lineH, &maxG);
+        snprintf(buf, B, "gutter (wrap): line 1 has %d rows; number ink row0=%d continuation rows=%d line2=%d; brightest green %d (number colour %d); gutter bg #%06lX",
+                 rows, ink0, inkC, ink1, maxG, GetGValue(C_WS), (unsigned long)(px[0] & 0xFFFFFF));
+        STCheck(rows > 1 && ink0 > 0 && inkC == 0 && ink1 > 0 && maxG <= GetGValue(C_WS) + 8 && (px[0] & 0xFFFFFF) == PxOf(C_FRAME), buf);
+        free(px);
+        snprintf(buf, B, "gutter (wrap): wrap width %d = client %d - gutter %d - margins - caret; widest row %d, right edge %d <= %d",
+                 WrapW(), g_cw, g_gut, worst, XClient(worst), g_cw - g_margin);
+        STCheck(WrapW() == g_cw - g_gut - 2 * g_margin - g_caretW && worst <= WrapW() && XClient(worst) <= g_cw - g_margin, buf);
+        /* no wrap, scrolled right: the text passes under the gutter and is not drawn over it */
+        g_wrap = FALSE; g_layoutVer++; g_topRow = 0; g_sx = 0;
+        Refresh(FALSE); UpdateWindow(g_hwnd);
+        g_sx = 300; ClampScroll(); Refresh(FALSE); UpdateWindow(g_hwnd);
+        px = Grab(FALSE); maxG = 0;
+        int ink = GutterInk(px, 0, g_lineH, &maxG), text = 0;
+        for (int y = 0; y < g_lineH; y++) for (int x = g_gut; x < g_cw; x++) text += ((px[y * g_cw + x] >> 8) & 255) > 0x80;
+        snprintf(buf, B, "gutter (no wrap, scrolled %dpx): gutter ink=%d brightest green %d; text pixels right of it=%d", g_sx, ink, maxG, text);
+        STCheck(g_sx > 0 && ink > 0 && maxG <= GetGValue(C_WS) + 8 && text > 0, buf);
+        free(px);
+        POINT cp; g_caret = g_anchor = 150; EnsureVisible(); Refresh(FALSE); GetCaretPos(&cp);
+        size_t hp = PosFromPoint(cp.x + 1, g_lineH / 2);
+        snprintf(buf, B, "gutter (no wrap, scrolled %dpx): caret x=%ld >= gutter %d, hit test there -> %u (150)", g_sx, cp.x, g_gut, (unsigned)hp);
+        STCheck(cp.x >= g_gut && hp == 150, buf);
+        g_sx = 0;
+    }
+    g_mdView = TRUE;
+    snprintf(buf, B, "gutter not in the Markdown view: width %d", GutterW());
+    STCheck(GutterW() == 0, buf);
+    g_mdView = FALSE;
+    SetKey(VK_CONTROL, TRUE); OnKeyDown('L'); SetKey(VK_CONTROL, FALSE);
+    snprintf(buf, B, "Ctrl+L again: line numbers=%d gutter=%d", g_lineNo, g_gut);
+    STCheck(!g_lineNo && g_gut == 0, buf);
+
+    /* ---- 13. line spacing, title gap ---- */
+    {
+        int lead = g_lineH - g_textH;
+        snprintf(buf, B, "line spacing: font %dpx + leading %dpx (%d%%) = row %dpx, text top %dpx", g_textH, lead, lead * 100 / g_textH, g_lineH, g_ty);
+        STCheck(lead * 100 >= g_textH * 14 && lead * 100 <= g_textH * 21 && g_ty == lead / 2, buf);
+        SetTextForTest(L"前置き"); g_caret = g_anchor = 3;
+        SetComp(L"長井文章をへんかんすると");
+        Refresh(TRUE); UpdateWindow(g_hwnd);
+        DWORD *px = Grab(FALSE);
+        int top = -1, bot = -1;
+        for (int y = 0; y < g_lineH; y++) for (int x = 0; x < g_cw; x++) if ((px[y * g_cw + x] & 0xFFFFFF) != PxOf(C_BG)) { if (top < 0) top = y; bot = y; }
+        WCHAR t[256]; int n = LineCopy(0, TRUE, t, 256), co = g_ln.co;
+        int gap = Sc(1) < 1 ? 1 : Sc(1), uy = g_ty + g_textH - 2 * gap, ok = 0, all = 0;
+        if (uy < g_ty + g_ascent + gap) uy = g_ty + g_ascent + gap;
+        for (int x = g_margin + PrefixW(t, co) + gap; x < g_margin + PrefixW(t, co + 2) - gap; x++) { all++; ok += (px[uy * g_cw + x] & 0xFFFFFF) == PxOf(C_TEXT); }
+        POINT cp; GetCaretPos(&cp);
+        snprintf(buf, B, "line spacing: ink rows %d..%d inside the %dpx row (text box %d..%d), target underline at y=%d %d/%d px, caret y=%ld (row top, height = row), %d chars",
+                 top, bot, g_lineH, g_ty, g_ty + g_textH - 1, uy, ok, all, cp.y, n);
+        STCheck(top >= g_ty - 1 && bot < g_lineH - 1 && bot <= g_ty + g_textH && all > 10 && ok == all && cp.y == 0, buf);
+        free(px);
+        g_comp = FALSE; ClearComp();
+        RECT wr; GetWindowRect(g_hwnd, &wr); POINT tl = { wr.left, wr.top }; ScreenToClient(g_frame, &tl);
+        InvalidateRect(g_frame, NULL, FALSE); UpdateWindow(g_frame);
+        HDC fd = GetDC(g_frame); COLORREF gc = GetPixel(fd, Sc(40), CapH() + 1); ReleaseDC(g_frame, fd);
+        snprintf(buf, B, "title gap: text view starts at y=%ld = caption %d + gap %d; gap colour #%06lX", tl.y, CapH(), GapH(), (unsigned long)PxOf(gc));
+        STCheck(tl.y == CapH() + GapH() && gc == C_BG, buf);
+    }
+    /* ---- 14. find status bar ---- */
+    {
+        static const WCHAR tx[] = L"abc xabc\n\n𠮷abc abcabc\nnone";
+        SetTextForTest(tx);
+        int ch0 = g_ch;
+        FindShow(FALSE); SetWindowTextW(g_edFind, L"abc"); FindCompile();
+        for (int g = 0; IdleWork() && g < 100000; g++) {}
+        size_t ref[64]; int nref = RefMatches(g_re, tx, wcslen(tx), ref, 64) / 2;
+        snprintf(buf, B, "status bar: text area %d -> %dpx (bar %d); count %u (reference %d)", ch0, g_ch, Sc(22), (unsigned)g_mc.n, nref);
+        STCheck(g_ch == ch0 - Sc(22) && g_mc.done && (int)g_mc.n == nref && nref == 5, buf);
+        WCHAR sb[160], s2[160];
+        g_caret = g_anchor = 0; FindNext(TRUE); FindNext(TRUE); StatusText(sb, 160);
+        FindNext(TRUE); StatusText(s2, 160);
+        snprintf(buf, B, "status text after 2 / 3 x F3: \"%s\" / \"%s\"", W2U(sb), W2U(s2));
+        STCheck(!wcscmp(sb, L"行 1, 列 9\t2 / 5 件") && !wcscmp(s2, L"行 3, 列 5\t3 / 5 件"), buf);
+        UpdateWindow(g_frame);
+        RECT fr; GetClientRect(g_frame, &fr);
+        HDC fd = GetDC(g_frame); int light = 0; COLORREF bc = GetPixel(fd, 2, fr.bottom - 2);
+        for (int y = fr.bottom - Sc(22); y < fr.bottom; y++) for (int x = 0; x < Sc(120); x++) { COLORREF c = GetPixel(fd, x, y); light += GetRValue(c) > 0xA0 && GetGValue(c) > 0xA0; }
+        ReleaseDC(g_frame, fd);
+        snprintf(buf, B, "status bar colours: background #%06lX, light text pixels %d", (unsigned long)PxOf(bc), light);
+        STCheck(bc == C_FRAME && light > 10, buf);
+        SetWindowTextW(g_edFind, L"zzz"); FindCompile();
+        for (int g = 0; IdleWork() && g < 100000; g++) {}
+        StatusText(sb, 160);
+        snprintf(buf, B, "no match: \"%s\"", W2U(sb));
+        STCheck(wcsstr(sb, L"\t一致なし") != NULL, buf);
+        /* big document: counted in idle slices, "…" until known */
+        size_t NL = 300000; WCHAR *big = xmalloc((NL * 8 + 1) * sizeof(WCHAR));
+        for (size_t i = 0; i < NL; i++) memcpy(big + i * 8, L"abc def\n", 8 * sizeof(WCHAR));
+        big[NL * 8 - 1] = 0;
+        SetTextForTest(big); free(big);
+        SetWindowTextW(g_edFind, L"def"); FindCompile();
+        StatusText(sb, 160);
+        double t0 = NowMs(); int slices = 0;
+        while (IdleWork() && slices < 1000000) slices++;
+        double t1 = NowMs();
+        StatusText(s2, 160);
+        g_caret = g_anchor = 0; FindNext(TRUE); WCHAR s3[160]; StatusText(s3, 160);
+        g_caret = g_anchor = DocLen(); FindNext(FALSE); WCHAR s4[160]; StatusText(s4, 160);
+        snprintf(buf, B, "300k lines: before \"%s\", after %d idle slices (%.0f ms, Wine) \"%s\"; first \"%s\"; last \"%s\"", W2U(sb), slices, t1 - t0, W2U(s2), W2U(s3), W2U(s4));
+        STCheck(wcsstr(sb, L"\t… 件") && slices > 1 && !wcscmp(s2, L"行 1, 列 1\t300000 件") && wcsstr(s3, L"\t1 / 300000 件") && wcsstr(s4, L"\t300000 / 300000 件"), buf);
+        SetWindowTextW(g_edFind, L""); FindHide();
+        snprintf(buf, B, "popup closed: text area back to %dpx (%d)", g_ch, ch0);
+        STCheck(g_ch == ch0, buf);
+    }
+    /* ---- 15. IME composition in the find field (96 and 144 dpi) ---- */
+    STEdComp("");
+    { UINT d0 = g_dpi; g_dpi = 144; SetupFont(); FrameLayout(); STEdComp("[144dpi] "); g_dpi = d0; SetupFont(); FrameLayout(); }
+    /* ---- 16. Ctrl+Q keyboard resize ---- */
+    {
+        RECT r0; GetWindowRect(g_frame, &r0);
+        SetWindowPos(g_frame, NULL, Sc(10), Sc(10), Sc(700), Sc(500), SWP_NOZORDER | SWP_NOACTIVATE);
+        SetTextForTest(L"abc"); g_caret = g_anchor = 3; SetFocus(g_hwnd);
+        HIMC imc0 = ImmGetContext(g_hwnd); if (imc0) ImmReleaseContext(g_hwnd, imc0);
+        RECT a, b; GetWindowRect(g_frame, &a);
+        SetKey(VK_CONTROL, TRUE);
+        PressKey(g_hwnd, 'Q'); BOOL on = g_resize;
+        PressKey(g_hwnd, VK_RIGHT); PressKey(g_hwnd, 'Q'); PressKey(g_hwnd, VK_DOWN);
+        SetKey(VK_CONTROL, FALSE);
+        GetWindowRect(g_frame, &b);
+        int st = Sc(20);
+        snprintf(buf, B, "Ctrl+Q, then Ctrl held: Right, Q (repeat), Down -> mode=%d/%d, size %ldx%ld -> %ldx%ld (+%d each), top-left (%ld,%ld) -> (%ld,%ld)",
+                 on, g_resize, a.right - a.left, a.bottom - a.top, b.right - b.left, b.bottom - b.top, st, a.left, a.top, b.left, b.top);
+        STCheck(on && g_resize && b.right - a.right == st && b.bottom - a.bottom == st && a.left == b.left && a.top == b.top, buf);
+        PressKey(g_hwnd, 'D'); PressKey(g_hwnd, 'D'); PressKey(g_hwnd, 'A'); PressKey(g_hwnd, 'S'); PressKey(g_hwnd, 'W'); PressKey(g_hwnd, 'W');
+        GetWindowRect(g_frame, &a);
+        snprintf(buf, B, "W/A/S/D: size %ldx%ld (expect %ldx%ld), text \"%s\" unchanged", a.right - a.left, a.bottom - a.top, b.right - b.left + st, b.bottom - b.top - st, DocEquals(L"abc") ? "abc" : "changed");
+        STCheck(a.right - a.left == b.right - b.left + st && a.bottom - a.top == b.bottom - b.top - st && DocEquals(L"abc") && g_resize, buf);
+        SetKey(VK_SHIFT, TRUE); PressKey(g_hwnd, VK_RIGHT); PressKey(g_hwnd, VK_UP); SetKey(VK_SHIFT, FALSE);
+        GetWindowRect(g_frame, &b);
+        snprintf(buf, B, "Shift: fine step %ld x %ld (expect %d)", b.right - a.right, a.bottom - b.bottom, Sc(2));
+        STCheck(b.right - a.right == Sc(2) && a.bottom - b.bottom == Sc(2), buf);
+        MONITORINFO mi; mi.cbSize = sizeof mi; GetMonitorInfoW(MonitorFromWindow(g_frame, MONITOR_DEFAULTTONEAREST), &mi);
+        for (int i = 0; i < 300; i++) { ResizeKey(g_hwnd, VK_RIGHT); ResizeKey(g_hwnd, VK_DOWN); }
+        RECT v; GetWindowRect(g_frame, &b);
+        if (FAILED(DwmGetWindowAttribute(g_frame, DWMWA_EXTENDED_FRAME_BOUNDS, &v, sizeof v)) || IsRectEmpty(&v)) v = b;
+        snprintf(buf, B, "clamped to the work area: visible right/bottom %ld/%ld, work area %ld/%ld", v.right, v.bottom, mi.rcWork.right, mi.rcWork.bottom);
+        STCheck(v.right <= mi.rcWork.right && v.bottom <= mi.rcWork.bottom && v.right > mi.rcWork.right - st && v.bottom > mi.rcWork.bottom - st, buf);
+        for (int i = 0; i < 300; i++) { ResizeKey(g_hwnd, VK_LEFT); ResizeKey(g_hwnd, VK_UP); }
+        GetWindowRect(g_frame, &b);
+        snprintf(buf, B, "minimum size: %ldx%ld (min %dx%d), top-left still (%ld,%ld)", b.right - b.left, b.bottom - b.top, MinW(), MinH(), b.left, b.top);
+        STCheck(b.right - b.left == MinW() && b.bottom - b.top == MinH() && b.left == a.left && b.top == a.top, buf);
+        FrameLayout(); InvalidateCaption(); UpdateWindow(g_frame);
+        PressKey(g_hwnd, VK_RETURN);
+        HIMC imc1 = ImmGetContext(g_hwnd); if (imc1) ImmReleaseContext(g_hwnd, imc1);
+        snprintf(buf, B, "Enter ends the mode and is swallowed: mode=%d text unchanged=%d, IME context restored=%d", g_resize, DocEquals(L"abc"), imc1 == imc0);
+        STCheck(!g_resize && DocEquals(L"abc") && imc1 == imc0, buf);
+        SetKey(VK_CONTROL, TRUE); PressKey(g_hwnd, 'Q'); SetKey(VK_CONTROL, FALSE);
+        on = g_resize; PressKey(g_hwnd, 'X');
+        snprintf(buf, B, "another key ends the mode and is not swallowed: mode %d -> %d, text \"%s\"", on, g_resize, DocEquals(L"abcx") ? "abcx" : "?");
+        STCheck(on && !g_resize && DocEquals(L"abcx"), buf);
+        SetKey(VK_CONTROL, TRUE); PressKey(g_hwnd, 'Q'); SetKey(VK_CONTROL, FALSE);
+        on = g_resize; SendMessageW(g_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(5, 5)); SendMessageW(g_hwnd, WM_LBUTTONUP, 0, MAKELPARAM(5, 5));
+        snprintf(buf, B, "mouse click ends the mode: %d -> %d", on, g_resize);
+        STCheck(on && !g_resize, buf);
+        /* from the find field: D resizes and types nothing, Esc ends the mode but leaves the popup open */
+        FindShow(FALSE); SetWindowTextW(g_edFind, L"q"); SendMessageW(g_edFind, EM_SETSEL, 1, 1);
+        GetWindowRect(g_frame, &a);
+        SetKey(VK_CONTROL, TRUE); PressKey(g_edFind, 'Q'); SetKey(VK_CONTROL, FALSE);
+        on = g_resize; PressKey(g_edFind, 'D'); PressKey(g_edFind, VK_ESCAPE);
+        GetWindowRect(g_frame, &b);
+        WCHAR ft[16]; GetWindowTextW(g_edFind, ft, 16);
+        snprintf(buf, B, "in the find field: mode=%d, D -> +%ld px, field \"%s\", after Esc mode=%d popup open=%d", on, b.right - a.right, W2U(ft), g_resize, g_findOpen);
+        STCheck(on && b.right - a.right == st && !wcscmp(ft, L"q") && !g_resize && g_findOpen, buf);
+        SetWindowTextW(g_edFind, L""); FindHide();
+        ShowWindow(g_frame, SW_MAXIMIZE);
+        if (IsZoomed(g_frame)) {
+            ResizeBegin();
+            snprintf(buf, B, "maximized: Ctrl+Q does nothing (mode=%d)", g_resize);
+            STCheck(!g_resize, buf);
+            ResizeEnd();
+        } else STLog("[--] maximize not available here, check skipped\n");
+        ShowWindow(g_frame, SW_RESTORE);
+        SetWindowPos(g_frame, NULL, r0.left, r0.top, r0.right - r0.left, r0.bottom - r0.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetFocus(g_hwnd);
+    }
 }
 static void RunSelfTest(void) {
     char buf[512];
@@ -4401,8 +5033,9 @@ static void RunSelfTest(void) {
             t[n++] = L'\n';
         }
         t[n - 1] = 0;
-        int dn[2] = { 0, 0 }, ds[2] = { 0, 0 }; unsigned sp0 = g_scrollPaths;
-        for (int wm = 0; wm < 2; wm++) {
+        int dn[4] = { 0, 0, 0, 0 }, ds[4] = { 0, 0, 0, 0 }; unsigned sp0 = g_scrollPaths;
+        for (int v = 0; v < 4; v++) {                 /* no-wrap / wrap, without / with line numbers */
+            int wm = v & 1; g_lineNo = v >> 1;
             g_wrap = wm; g_layoutVer++;
             SetTextForTest(t);
             g_anchor = LineStart(3) + 2; g_caret = LineStart(12) + 5; g_showWs = TRUE;   /* selection + marks in view */
@@ -4412,15 +5045,15 @@ static void RunSelfTest(void) {
             HideCaret(g_hwnd); DWORD *a = Grab(FALSE), *sc = Grab(TRUE); ShowCaret(g_hwnd);
             Invalidate(); UpdateWindow(g_hwnd);
             DWORD *b = Grab(FALSE);
-            dn[wm] = PixDiff(a, b); ds[wm] = PixDiff(sc, b);
+            dn[v] = PixDiff(a, b); ds[v] = PixDiff(sc, b);
             free(a); free(b); free(sc);
             g_showWs = FALSE;
         }
         free(t);
-        snprintf(buf, sizeof buf, "back buffer: %u scroll steps drew only the exposed rows; vs full repaint: differing pixels no-wrap=%d wrap=%d, screen=%d/%d",
-                 g_scrollPaths - sp0, dn[0], dn[1], ds[0], ds[1]);
-        STCheck(g_scrollPaths - sp0 >= 18 && !dn[0] && !dn[1] && !ds[0] && !ds[1], buf);
-        g_wrap = FALSE; g_layoutVer++;
+        snprintf(buf, sizeof buf, "back buffer: %u scroll steps drew only the exposed rows; vs full repaint: differing pixels no-wrap=%d wrap=%d, screen=%d/%d; with line numbers %d %d, screen %d/%d",
+                 g_scrollPaths - sp0, dn[0], dn[1], ds[0], ds[1], dn[2], dn[3], ds[2], ds[3]);
+        STCheck(g_scrollPaths - sp0 >= 36 && !dn[0] && !dn[1] && !ds[0] && !ds[1] && !dn[2] && !dn[3] && !ds[2] && !ds[3], buf);
+        g_wrap = FALSE; g_lineNo = FALSE; g_layoutVer++;
     }
     /* ---- 5h. very long line: measured only as far as needed, completed in idle time ---- */
     {
@@ -4572,15 +5205,15 @@ static void RunSelfTest(void) {
         STCheck(wcscmp(t, L"memo3.txt") == 0, buf);
         wcscpy(g_path, old); UpdateTitle();
         WCHAR tmp[MAX_PATH], ip[MAX_PATH]; GetTempPathW(MAX_PATH, tmp); _snwprintf(ip, MAX_PATH, L"%lsced_selftest.ini", tmp); ip[MAX_PATH - 1] = 0;
-        int f0 = g_fontIdx, z0 = g_fontPt10; BOOL w0 = g_wrap, s0 = g_showWs;
-        g_fontIdx = 2; g_fontPt10 = 150; g_wrap = TRUE; g_showWs = TRUE;
+        int f0 = g_fontIdx, z0 = g_fontPt10; BOOL w0 = g_wrap, s0 = g_showWs, l0 = g_lineNo;
+        g_fontIdx = 2; g_fontPt10 = 150; g_wrap = TRUE; g_showWs = TRUE; g_lineNo = TRUE;
         BOOL wr = IniWriteTo(ip);
-        g_fontIdx = 0; g_fontPt10 = 110; g_wrap = FALSE; g_showWs = FALSE;
+        g_fontIdx = 0; g_fontPt10 = 110; g_wrap = FALSE; g_showWs = FALSE; g_lineNo = FALSE;
         IniReadFrom(ip);
-        snprintf(buf, sizeof buf, "ini round trip (%s): write=%d font=%d zoom=%d wrap=%d ws=%d", W2U(ip), wr, g_fontIdx, g_fontPt10, g_wrap, g_showWs);
-        STCheck(wr && g_fontIdx == 2 && g_fontPt10 == 150 && g_wrap && g_showWs, buf);
+        snprintf(buf, sizeof buf, "ini round trip (%s): write=%d font=%d zoom=%d wrap=%d ws=%d linenumbers=%d", W2U(ip), wr, g_fontIdx, g_fontPt10, g_wrap, g_showWs, g_lineNo);
+        STCheck(wr && g_fontIdx == 2 && g_fontPt10 == 150 && g_wrap && g_showWs && g_lineNo, buf);
         DeleteFileW(ip);
-        g_fontIdx = f0; g_fontPt10 = z0; g_wrap = w0; g_showWs = s0; g_iniHaveRect = FALSE;
+        g_fontIdx = f0; g_fontPt10 = z0; g_wrap = w0; g_showWs = s0; g_lineNo = l0; g_iniHaveRect = FALSE;
         BOOL bad = IniWriteTo(L"Z:\\no\\such\\dir\\x.ini");
         snprintf(buf, sizeof buf, "ini: unwritable path reports failure (-> %%APPDATA%% fallback): %d", !bad);
         STCheck(!bad, buf);
@@ -4601,6 +5234,8 @@ static void RunSelfTest(void) {
         snprintf(buf, sizeof buf, "zoom in %d -> %d, reset -> %d", z, z1, g_fontPt10);
         STCheck(z1 == z + 10 && g_fontPt10 == 110, buf);
     }
+    /* ================= v1.4 ================= */
+    ST14(buf);
     snprintf(buf, sizeof buf, "RESULT: %s (%d checks, %d failures)\n", g_stfail ? "FAIL" : "PASS", g_stcount, g_stfail);
     STLog("%s", buf);
     if (g_stf) fclose(g_stf);
@@ -4620,7 +5255,7 @@ static void RunSelfTest(void) {
 /* demo (screenshots) and benchmark modes                              */
 /* ================================================================== */
 static const WCHAR kDemoText[] =
-    L"# CEditor 1.3 デモ\n"
+    L"# CEditor 1.4 デモ\n"
     L"\n"
     L"カスタム描画のテキストエディタです。**太字**、*斜体*、***太字斜体***、~~取り消し線~~、`コード`。\n"
     L"全角スペース「　」と半角スペース「 」とタブ「\t」を含む行。\n"
@@ -4662,6 +5297,18 @@ static void RunDemo(void) {
         SetMdView(TRUE);
     } else if (!wcscmp(g_demo, L"wrap")) {
         g_wrap = TRUE; g_layoutVer++; g_caret = g_anchor = DocLen();
+    } else if (!wcscmp(g_demo, L"lineno")) {
+        g_lineNo = TRUE; g_wrap = TRUE; g_layoutVer++; g_caret = g_anchor = LineStart(9) + 20;
+    } else if (!wcscmp(g_demo, L"findsb")) {
+        g_caret = g_anchor = 0;
+        FindShow(FALSE); SetWindowTextW(g_edFind, L"箇条書き"); FindCompile(); FindNext(TRUE); FindNext(TRUE);
+    } else if (!wcscmp(g_demo, L"findcomp")) {
+        g_caret = g_anchor = 0;
+        FindShow(FALSE); SetWindowTextW(g_edFind, L"検索"); FindCompile();
+        SetFocus(g_edFind); SendMessageW(g_edFind, EM_SETSEL, 2, 2);
+        FillTestComp(L"長井文章を変換"); g_edComp = g_edFind; EdCompRefresh(g_edFind);
+    } else if (!wcscmp(g_demo, L"resize")) {
+        g_caret = g_anchor = LineEnd(2); SetFocus(g_hwnd); ResizeBegin();
     } else if (!wcscmp(g_demo, L"comp")) {
         g_caret = g_anchor = LineEnd(3);
         SetComp(L"長井文章を変換");
@@ -4777,10 +5424,12 @@ static BOOL IdleWork(void) {
         if (ln.li->rdone && !g_lm[g_bgL].rows) SetRowCount(g_bgL, ln.li->nr);
         busy = IdleBusy(t0);
     }
-    /* 3) compaction of the piece table, then give back memory no longer used */
+    /* 3) the match count of the find status bar */
+    if (!busy && g_findOpen && g_re) { BOOL more = McStep(t0); StatusUpdate(); busy = more; }
+    /* 4) compaction of the piece table, then give back memory no longer used */
     while (!busy && !CompactStep(256)) busy = IdleBusy(t0);
     if (!busy && g_gcDue) { ReleaseUnused(); busy = IdleBusy(t0); }
-    /* 4) bound the memory of the line cache */
+    /* 5) bound the memory of the line cache */
     if (g_ninfo > INFO_MAX) {
         size_t a = g_top > INFO_MAX / 4 ? g_top - INFO_MAX / 4 : 0, b = g_top + INFO_MAX / 4;
         for (size_t L = 0; L < g_nl; L++) if (g_lm[L].li && (L < a || L > b) && L != g_ln.L) InfoFree(L);
