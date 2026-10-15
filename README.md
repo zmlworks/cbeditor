@@ -45,6 +45,18 @@ EDIT / RichEdit コントロールを一切使わず、テキストバッファ 
 
 TSF ベースの新しい MS-IME も、Windows が提供する IMM32 互換レイヤ経由で上記メッセージを送ってくるため、この経路で動作します (TSF の ITextStoreACP は未実装)。
 
+## 自己診断モード (デバッグ用)
+    editor.exe --selftest C:\temp\st.txt
+起動後に以下を自動検証してログに `[OK]/[NG]` と `RESULT: PASS/FAIL` を書き出し、画面にはデモ用の未確定文字列 (太線/細線/点線) を表示したまま残ります。
+- 各行の文字位置 (MeasureLine) と GetTextExtentPoint32 の前方一致幅の一致 (和文/半角カナ/サロゲート/絵文字)
+- 「テスト」+← のキャレット位置、クリック位置→文字位置、タブ幅
+- 未確定文字列の終端・GCS_CURSORPOS キャレット・IMR_QUERYCHARPOSITION・候補窓 CFS_EXCLUDE 矩形
+- スクロールバー: 3 行/画面ちょうどの行数では非表示、1 行超えると縦バー表示、長い行で横バー表示、短く戻すと消える
+実機 Windows でも一度実行して PASS になるか確認してください。
+
+## 変更履歴
+- v1.0.1: 実機 Windows でキャレット・変換下線・候補窓が右にずれる不具合を修正 (GetTextExtentExPointW の nMaxExtent=0 + lpnFit 指定により部分幅配列が未設定だった)。スクロールバーをメモ帳同様「内容がはみ出した時だけ表示」に変更し、最終行を越えるスクロールを廃止
+
 ## 手動テスト チェックリスト (Windows 11 + Microsoft IME で実施してください)
 比較対象の標準 EDIT として「ファイル名を指定して実行」(Win+R) の入力欄などを横に並べると分かりやすいです (Windows 11 の新メモ帳は EDIT ではありません)。
 

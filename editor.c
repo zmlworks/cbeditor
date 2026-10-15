@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <limits.h>
 
 #define APPNAME L"CEditor"
 #define CLS     L"CEditorMainWnd"
@@ -134,6 +137,8 @@ static BOOL g_dragging; static int g_dragMode; /* 0 char, 1 word */
 static size_t g_wordA, g_wordB;
 static int g_wheelAcc, g_hwheelAcc;
 static int g_lastMouseX, g_lastMouseY;
+
+static int g_selftest; static WCHAR g_stlog[MAX_PATH * 4];  /* --selftest <log> (debug/wine) */
 
 /* IME composition state */
 static BOOL g_comp;                 /* between START/ENDCOMPOSITION */
@@ -297,8 +302,15 @@ static void MeasureLine(int n) {
         while (k < j - i) {          /* chunk huge runs */
             int cn = j - i - k;
             if (cn > 8192) { cn = 8192; if (IS_HI(g_lb[i + k + cn - 1])) cn--; }
-            SIZE sz; int fit = 0;
-            GetTextExtentExPointW(g_hdcM, g_lb + i + k, cn, 0, &fit, g_dx, &sz);
+            /* NOTE (bug fix): Windows fills lpnDx only for the first *lpnFit characters that fit in
+               nMaxExtent. The old code passed nMaxExtent = 0 with lpnFit != NULL, so on real Windows
+               fit = 0 and g_dx was left uninitialised (Wine fills it anyway). Use INT_MAX and verify. */
+            SIZE sz = { 0, 0 }; int fit = 0;
+            if (!GetTextExtentExPointW(g_hdcM, g_lb + i + k, cn, INT_MAX, &fit, g_dx, &sz) || fit < cn) {
+                /* fallback: per-prefix measurement (slow but exact) */
+                for (int t = 1; t <= cn; t++) { SIZE z; GetTextExtentPoint32W(g_hdcM, g_lb + i + k, t, &z); g_dx[t - 1] = z.cx; }
+                sz.cx = g_dx[cn - 1];
+            }
             g_lx[i + k] = x;
             for (int t = 1; t < cn; t++) g_lx[i + k + t] = x + g_dx[t - 1];
             x += sz.cx; k += cn;
@@ -351,15 +363,27 @@ static size_t PosFromPoint(int x, int y) {
 }
 
 /* ---------------- scrolling / caret ---------------- */
+static int ContentW(void) { return g_maxW + g_margin * 2 + g_caretW; }  /* px */
+static void ClampScroll(void);
+/* Like Notepad: scrollbars are shown only when the content exceeds the client area.
+   Vertical unit = line (nMax = lines-1, nPage = fully visible lines), horizontal unit = px. */
 static void UpdateScrollBars(void) {
-    SCROLLINFO si = { sizeof si, SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL, 0, 0, 0, 0, 0 };
-    size_t mx = g_nl - 1 + (size_t)VisLines() - 1;
-    si.nMax = mx > 0x7FFFFFF ? 0x7FFFFFF : (int)mx; si.nPage = (UINT)VisLines(); si.nPos = (int)g_top;
-    SetScrollInfo(g_hwnd, SB_VERT, &si, TRUE);
-    SCROLLINFO hi = { sizeof hi, SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL, 0, 0, 0, 0, 0 };
-    int w = g_cw > 0 ? g_cw : 1;
-    hi.nMax = g_maxW + g_margin * 2 + w / 3; hi.nPage = (UINT)w; hi.nPos = g_sx;
-    SetScrollInfo(g_hwnd, SB_HORZ, &hi, TRUE);
+    static BOOL busy;
+    if (busy || !g_hwnd) return;
+    busy = TRUE;
+    for (int pass = 0; pass < 3; pass++) {   /* showing/hiding a bar changes the client size */
+        int cw0 = g_cw, ch0 = g_ch;
+        ClampScroll();
+        SCROLLINFO si = { sizeof si, SIF_RANGE | SIF_PAGE | SIF_POS, 0, 0, 0, 0, 0 };
+        si.nMax = g_nl - 1 > 0x7FFFFFF ? 0x7FFFFFF : (int)(g_nl - 1);
+        si.nPage = (UINT)VisLines(); si.nPos = (int)g_top;
+        SetScrollInfo(g_hwnd, SB_VERT, &si, TRUE);
+        SCROLLINFO hi = { sizeof hi, SIF_RANGE | SIF_PAGE | SIF_POS, 0, 0, 0, 0, 0 };
+        hi.nMax = ContentW() - 1; hi.nPage = (UINT)(g_cw > 0 ? g_cw : 1); hi.nPos = g_sx;
+        SetScrollInfo(g_hwnd, SB_HORZ, &hi, TRUE);
+        if (cw0 == g_cw && ch0 == g_ch) break;
+    }
+    busy = FALSE;
 }
 static void UpdateImeWindows(void);
 static void PlaceCaret(void) {
@@ -367,9 +391,10 @@ static void PlaceCaret(void) {
     if (g_focus) UpdateImeWindows();
 }
 static void ClampScroll(void) {
-    size_t maxTop = g_nl > 1 ? g_nl - 1 : 0;
+    size_t vis = (size_t)VisLines();
+    size_t maxTop = g_nl > vis ? g_nl - vis : 0;   /* no scrolling past the last line (like EDIT) */
     if (g_top > maxTop) g_top = maxTop;
-    int maxSx = g_maxW + g_margin * 2 + g_cw / 3 - g_cw; if (maxSx < 0) maxSx = 0;
+    int maxSx = ContentW() - g_cw; if (maxSx < 0) maxSx = 0;
     if (g_sx > maxSx) g_sx = maxSx;
     if (g_sx < 0) g_sx = 0;
 }
@@ -381,9 +406,10 @@ static void EnsureVisible(void) {
     else if (L >= g_top + (size_t)vis) g_top = L - (size_t)vis + 1;
     int x = pt.x + g_sx - g_margin;
     int w = g_cw - g_margin * 2; if (w < 20) w = 20;
+    if (x + g_caretW > g_maxW) g_maxW = x + g_caretW;
     /* during composition keep the whole target visible if possible */
     if (x < g_sx) { g_sx = x - w / 4; }
-    else if (x + g_caretW > g_sx + w) g_sx = x + g_caretW - w + w / 4;
+    else if (x + g_caretW > g_sx + w) { g_sx = x + g_caretW - w + w / 4; if (g_sx + w > g_maxW) g_maxW = g_sx + w; }
     if (g_sx < 0) g_sx = 0;
 }
 static void Refresh(BOOL ensure) {
@@ -729,6 +755,8 @@ static void Paint(HDC hdc) {
     size_t sa = SelA(), sb = SelB();
     int vis = VisLines() + 1;
     int ox = g_margin - g_sx;
+    int keepW = g_sx > 0 ? g_sx + g_cw - g_margin * 2 - g_caretW : 0;  /* keep current h-scroll valid */
+    g_maxW = keepW > 0 ? keepW : 0;
     for (int r = 0; r < vis; r++) {
         size_t L = g_top + (size_t)r;
         if (L >= g_nl) break;
@@ -980,6 +1008,7 @@ static void StartReconversion(void) {
 }
 
 /* ---------------- caret movement / keyboard ---------------- */
+static void OnKeyDown(WPARAM vk);
 static void MoveTo(size_t p, BOOL extend, BOOL keepX) {
     size_t len = DocLen(); if (p > len) p = len;
     g_caret = p; if (!extend) g_anchor = p;
@@ -1095,6 +1124,148 @@ static void OnChar(WPARAM ch) {
     UpdateTitle(); Refresh(TRUE);
 }
 
+
+/* ---------------- self test (run with: editor.exe --selftest log.txt) ----------------
+   Verifies that every x position (caret, hit test, composition, IMR_QUERYCHARPOSITION)
+   comes from the same measurement as drawing, and that scrollbars appear only when needed. */
+static FILE *g_stf; static int g_stfail;
+static void STLog(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    if (g_stf) { vfprintf(g_stf, fmt, ap); fflush(g_stf); }
+    va_end(ap);
+}
+static void STCheck(int ok, const char *what) { STLog("[%s] %s\n", ok ? "OK" : "NG", what); if (!ok) g_stfail++; }
+static int PrefixW(const WCHAR *s, int n) { /* independent reference: GetTextExtentPoint32 on a fresh DC */
+    HDC dc = GetDC(g_hwnd); HGDIOBJ o = SelectObject(dc, g_font);
+    SIZE z = { 0, 0 }; if (n) GetTextExtentPoint32W(dc, s, n, &z);
+    SelectObject(dc, o); ReleaseDC(g_hwnd, dc); return z.cx;
+}
+static BOOL HasStyle(DWORD st) { return (GetWindowLongW(g_hwnd, GWL_STYLE) & st) != 0; }
+static void SetTextForTest(const WCHAR *t) {
+    SetDocText(t, wcslen(t)); ResetDoc(); g_comp = FALSE; ClearComp();
+    UpdateScrollBars(); InvalidateRect(g_hwnd, NULL, FALSE); UpdateWindow(g_hwnd); UpdateScrollBars();
+}
+static void RunSelfTest(void) {
+    char buf[256];
+    g_stf = _wfopen(g_stlog, L"w");
+    SetFocus(g_hwnd);
+    RECT rc; GetClientRect(g_hwnd, &rc);
+    STLog("dpi=%u client=%ldx%ld lineH=%d font=%ls\n", g_dpi, rc.right, rc.bottom, g_lineH, g_lf.lfFaceName);
+    /* 1. per-line measurement vs reference prefix widths (lines without tabs) */
+    static const WCHAR *const lines[] = { L"テスト", L"abc def_ghi XYZ", L"長井文章をへんかんすると下線が長くなります",
+                                          L"𠮷野家😀と絵文字", L"ｱｲｳ半角ｶﾅ ﾃｽﾄ mixed 全角ＡＢＣ" };
+    for (int li = 0; li < 5; li++) {
+        SetTextForTest(lines[li]);
+        int n = BuildLine(0, FALSE, NULL); MeasureLine(n);
+        int maxd = 0;
+        for (int i = 0; i <= n; i++) {
+            if (i < n && IS_LO(g_lb[i])) continue;
+            int d = abs(g_lx[i] - PrefixW(g_lb, i)); if (d > maxd) maxd = d;
+        }
+        snprintf(buf, sizeof buf, "line %d: MeasureLine vs GetTextExtentPoint32 prefix, max diff=%dpx (width=%d)", li, maxd, g_lx[n]);
+        STCheck(maxd <= 1, buf);
+    }
+    /* 2. caret after typing テスト + Left: between ス and ト */
+    SetTextForTest(L"テスト");
+    g_caret = g_anchor = 3; OnKeyDown(VK_LEFT);
+    POINT cp; GetCaretPos(&cp);
+    int expect = g_margin + PrefixW(L"テスト", 2);
+    snprintf(buf, sizeof buf, "caret after Left: GetCaretPos.x=%ld expected=%d (caret index %u)", cp.x, expect, (unsigned)g_caret);
+    STCheck(labs(cp.x - expect) <= 1 && g_caret == 2, buf);
+    /* hit test round trip */
+    size_t hp = PosFromPoint(expect + 1, g_lineH / 2);
+    snprintf(buf, sizeof buf, "hit test at x=%d -> pos %u (expected 2)", expect + 1, (unsigned)hp);
+    STCheck(hp == 2, buf);
+    /* tabs: width of "a\tb" prefix */
+    SetTextForTest(L"a\tb");
+    { int n = BuildLine(0, FALSE, NULL); MeasureLine(n);
+      snprintf(buf, sizeof buf, "tab: x(b)=%d expected=%d", g_lx[2], g_tabW);
+      STCheck(g_lx[2] == g_tabW, buf); }
+    /* 3. composition: underline/caret/QUERYCHARPOSITION use the same positions as drawing */
+    SetTextForTest(L"前置き");
+    g_caret = g_anchor = 3;
+    BeginComp();
+    {
+        static const WCHAR comp[] = L"長井文章をへんかんすると";
+        g_clen = (int)wcslen(comp);
+        g_cstr = xrealloc(g_cstr, (size_t)(g_clen + 1) * sizeof(WCHAR)); memcpy(g_cstr, comp, (size_t)g_clen * sizeof(WCHAR));
+        g_cattr = xrealloc(g_cattr, (size_t)g_clen + 1);
+        for (int i = 0; i < g_clen; i++) g_cattr[i] = i < 2 ? ATTR_TARGET_CONVERTED : (i < 5 ? ATTR_CONVERTED : ATTR_INPUT);
+        g_ccl = xrealloc(g_ccl, 4 * sizeof(DWORD)); g_ccl[0] = 0; g_ccl[1] = 2; g_ccl[2] = 5; g_ccl[3] = (DWORD)g_clen; g_nccl = 4;
+        g_ccur = 2; g_cpos = g_caret;
+        Refresh(TRUE); UpdateWindow(g_hwnd);
+        int co; int n = BuildLine(0, TRUE, &co); MeasureLine(n);
+        int full = PrefixW(g_lb, n);
+        snprintf(buf, sizeof buf, "composition end x=%d vs reference width=%d (underline ends here)", g_lx[co + g_clen], full);
+        STCheck(abs(g_lx[co + g_clen] - full) <= 1, buf);
+        GetCaretPos(&cp);
+        expect = g_margin + PrefixW(g_lb, co + 2);
+        snprintf(buf, sizeof buf, "caret in composition (GCS_CURSORPOS=2): x=%ld expected=%d", cp.x, expect);
+        STCheck(labs(cp.x - expect) <= 1, buf);
+        int maxd = 0;
+        for (int k = 0; k <= g_clen; k++) {
+            IMECHARPOSITION ip; memset(&ip, 0, sizeof ip); ip.dwSize = sizeof ip; ip.dwCharPos = (DWORD)k;
+            OnImeRequest(IMR_QUERYCHARPOSITION, (LPARAM)&ip);
+            POINT p = ip.pt; ScreenToClient(g_hwnd, &p);
+            int e = g_margin + PrefixW(g_lb, co + k);
+            int d = abs(p.x - e); if (d > maxd) maxd = d;
+        }
+        snprintf(buf, sizeof buf, "IMR_QUERYCHARPOSITION max diff=%dpx", maxd);
+        STCheck(maxd <= 1, buf);
+        CANDIDATEFORM cf; memset(&cf, 0, sizeof cf);
+        OnImeRequest(IMR_CANDIDATEWINDOW, (LPARAM)&cf);
+        expect = g_margin + PrefixW(g_lb, co);
+        snprintf(buf, sizeof buf, "candidate CFS_EXCLUDE rect=(%ld,%ld)-(%ld,%ld), target clause starts at x=%d",
+                 cf.rcArea.left, cf.rcArea.top, cf.rcArea.right, cf.rcArea.bottom, expect);
+        STCheck(labs(cf.rcArea.left - expect) <= 1 && labs(cf.rcArea.right - (g_margin + PrefixW(g_lb, co + 2))) <= 1, buf);
+        g_comp = FALSE; ClearComp();
+    }
+    /* 4. scrollbars only when needed */
+    SetTextForTest(L"1行目\n2行目\n3行目");
+    snprintf(buf, sizeof buf, "3 lines: VSCROLL visible=%d HSCROLL visible=%d (expect 0 0)", HasStyle(WS_VSCROLL), HasStyle(WS_HSCROLL));
+    STCheck(!HasStyle(WS_VSCROLL) && !HasStyle(WS_HSCROLL), buf);
+    {
+        int vis = VisLines(); size_t n = (size_t)vis;  /* exactly a full page: still no bar */
+        WCHAR *t = xmalloc((n * 2 + 1) * sizeof(WCHAR));
+        for (size_t i = 0; i < n; i++) { t[i * 2] = L'x'; t[i * 2 + 1] = L'\n'; }
+        t[n * 2 - 1] = 0;
+        SetTextForTest(t);
+        snprintf(buf, sizeof buf, "%d lines (= visible lines): VSCROLL visible=%d (expect 0)", vis, HasStyle(WS_VSCROLL));
+        STCheck(!HasStyle(WS_VSCROLL), buf);
+        t[n * 2 - 1] = L'\n'; t[n * 2] = 0;   /* one more line */
+        SetTextForTest(t);
+        snprintf(buf, sizeof buf, "%d lines: VSCROLL visible=%d (expect 1)", vis + 1, HasStyle(WS_VSCROLL));
+        STCheck(HasStyle(WS_VSCROLL), buf);
+        free(t);
+    }
+    {
+        WCHAR t[401]; for (int i = 0; i < 400; i++) t[i] = L'あ'; t[400] = 0;
+        SetTextForTest(t);
+        snprintf(buf, sizeof buf, "long line: HSCROLL visible=%d (expect 1)", HasStyle(WS_HSCROLL));
+        STCheck(HasStyle(WS_HSCROLL), buf);
+    }
+    SetTextForTest(L"短い");
+    snprintf(buf, sizeof buf, "back to short text: VSCROLL=%d HSCROLL=%d (expect 0 0)", HasStyle(WS_VSCROLL), HasStyle(WS_HSCROLL));
+    STCheck(!HasStyle(WS_VSCROLL) && !HasStyle(WS_HSCROLL), buf);
+    STLog("RESULT: %s (%d failures)\n", g_stfail ? "FAIL" : "PASS", g_stfail);
+    if (g_stf) fclose(g_stf);
+    g_stf = NULL;
+    /* leave a demo composition on screen for screenshots */
+    SetTextForTest(L"テスト\n長井文章をへんかんすると下線が長くなります\nタブ\tの後\n𠮷野家😀");
+    g_caret = g_anchor = LineEnd(1);
+    BeginComp();
+    {
+        static const WCHAR comp[] = L"長井文章を変換";
+        g_clen = (int)wcslen(comp);
+        g_cstr = xrealloc(g_cstr, (size_t)(g_clen + 1) * sizeof(WCHAR)); memcpy(g_cstr, comp, (size_t)g_clen * sizeof(WCHAR));
+        g_cattr = xrealloc(g_cattr, (size_t)g_clen + 1);
+        for (int i = 0; i < g_clen; i++) g_cattr[i] = i < 2 ? ATTR_TARGET_CONVERTED : (i < 5 ? ATTR_CONVERTED : ATTR_INPUT);
+        g_ccl = xrealloc(g_ccl, 4 * sizeof(DWORD)); g_ccl[0] = 0; g_ccl[1] = 2; g_ccl[2] = 5; g_ccl[3] = (DWORD)g_clen; g_nccl = 4;
+        g_ccur = 2; g_cpos = g_caret;
+    }
+    Refresh(TRUE);
+}
+
 /* ---------------- window ---------------- */
 static HMENU BuildMenu(void) {
     HMENU bar = CreateMenu(), f = CreatePopupMenu(), e = CreatePopupMenu(), v = CreatePopupMenu();
@@ -1186,6 +1357,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         Paint(dc);
         EndPaint(h, &ps);
         if (g_maxW != oldMax) UpdateScrollBars();
+        if (g_selftest == 1) { g_selftest = 2; PostMessageW(h, WM_APP + 1, 0, 0); }
         return 0;
     }
     case WM_SETFOCUS:
@@ -1348,6 +1520,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         CompleteComposition();
         if (ConfirmDiscard()) DestroyWindow(h);
         return 0;
+    case WM_APP + 1:
+        RunSelfTest();
+        return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -1373,7 +1548,11 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     SetupFont();
     UpdateTitle();
     int argc = 0; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (argv && argc > 1) LoadFile(argv[1]);
+    if (argv && argc > 2 && wcscmp(argv[1], L"--selftest") == 0) {
+        wcsncpy(g_stlog, argv[2], sizeof g_stlog / sizeof g_stlog[0] - 1);
+        g_selftest = 1;
+        SetWindowPos(h, NULL, 0, 0, MulDiv(800, (int)g_dpi, 96), MulDiv(600, (int)g_dpi, 96), SWP_NOMOVE | SWP_NOZORDER);
+    } else if (argv && argc > 1) LoadFile(argv[1]);
     if (argv) LocalFree(argv);
     ShowWindow(h, show); UpdateWindow(h);
     MSG msg;
