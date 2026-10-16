@@ -1,5 +1,5 @@
 /*
- * CEditor 1.3 - custom-drawn Win32 text editor with EDIT-compatible inline Japanese IME,
+ * CBEditor 1.4 - custom-drawn Win32 text editor with EDIT-compatible inline Japanese IME,
  * custom title bar, find/replace (own regex engine), word wrap, large files, Markdown view.
  * Plain C / Win32 / GDI / IMM32 / DWM. No EDIT/RichEdit for the document itself.
  */
@@ -30,11 +30,11 @@
 #include <psapi.h>
 #include "regex.h"
 
-#define APPNAME   L"CEditor"
-#define APPVER    L"1.4.0"
-#define CLS_FRAME L"CEditorFrame"
-#define CLS_TEXT  L"CEditorText"
-#define CLS_FIND  L"CEditorFind"
+#define APPNAME   L"CBEditor"
+#define APPVER    L"1.4.1"
+#define CLS_FRAME L"CBEditorFrame"
+#define CLS_TEXT  L"CBEditorText"
+#define CLS_FIND  L"CBEditorFind"
 
 /* colours (spec) */
 #define C_FRAME     RGB(0x3D, 0x01, 0x05)
@@ -3648,18 +3648,25 @@ static LRESULT CALLBACK TextProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 /* ================================================================== */
-/* settings (.ini next to the exe; falls back to %APPDATA%\CEditor)    */
+/* settings (cbeditor.ini next to the exe, else %APPDATA%\CBEditor)   */
 /* ================================================================== */
 static BOOL g_noIni;
 static BOOL g_iniHaveRect; static RECT g_iniRect; static BOOL g_iniMax;
-static void IniPaths(WCHAR *exeIni, WCHAR *appIni) {
+static void IniPathsAs(WCHAR *exeIni, WCHAR *appIni, const WCHAR *dir, const WCHAR *name) {
     GetModuleFileNameW(NULL, exeIni, MAX_PATH * 4);
     WCHAR *s = wcsrchr(exeIni, L'\\'); if (s) s[1] = 0; else exeIni[0] = 0;
-    wcscat(exeIni, L"editor.ini");
+    wcscat(exeIni, name);
     appIni[0] = 0;
     DWORD n = GetEnvironmentVariableW(L"APPDATA", appIni, MAX_PATH * 3);
     if (n == 0 || n >= MAX_PATH * 3) appIni[0] = 0;
-    else wcscat(appIni, L"\\CEditor\\editor.ini");
+    else { wcscat(appIni, L"\\"); wcscat(appIni, dir); wcscat(appIni, L"\\"); wcscat(appIni, name); }
+}
+static void IniPaths(WCHAR *exeIni, WCHAR *appIni) { IniPathsAs(exeIni, appIni, L"CBEditor", L"cbeditor.ini"); }
+/* the file to read: cbeditor.ini (next to the exe, then %APPDATA%), else the settings of CEditor <= 1.4.0
+   (editor.ini next to the exe, then %APPDATA%\CEditor). Saving always writes the new name. */
+static const WCHAR *IniPick(const WCHAR *const c[4]) {
+    for (int i = 0; i < 4; i++) if (c[i][0] && GetFileAttributesW(c[i]) != INVALID_FILE_ATTRIBUTES) return c[i];
+    return NULL;
 }
 static void IniReadFrom(const WCHAR *p) {
     WCHAR b[32];
@@ -3686,9 +3693,10 @@ static void IniReadFrom(const WCHAR *p) {
 }
 static void LoadIni(void) {
     WCHAR a[MAX_PATH * 4], b[MAX_PATH * 4];
-    IniPaths(a, b);
-    if (GetFileAttributesW(a) != INVALID_FILE_ATTRIBUTES) { wcscpy(g_iniPath, a); IniReadFrom(a); }
-    else if (b[0] && GetFileAttributesW(b) != INVALID_FILE_ATTRIBUTES) { wcscpy(g_iniPath, b); IniReadFrom(b); }
+    WCHAR c[MAX_PATH * 4], d[MAX_PATH * 4];
+    IniPaths(a, b); IniPathsAs(c, d, L"CEditor", L"editor.ini");
+    const WCHAR *const cand[4] = { a, b, c, d }, *f = IniPick(cand);
+    if (f) { wcscpy(g_iniPath, f); IniReadFrom(f); }
 }
 static BOOL IniPut(const WCHAR *sec, const WCHAR *key, int v, const WCHAR *p) {
     WCHAR b[32]; _snwprintf(b, 32, L"%d", v); b[31] = 0;
@@ -4093,7 +4101,7 @@ static LRESULT CALLBACK FrameProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 }
 
 /* ================================================================== */
-/* self test (editor.exe --selftest log.txt)                           */
+/* self test (cbeditor.exe --selftest log.txt)                         */
 /* ================================================================== */
 static FILE *g_stf; static int g_stfail, g_stcount;
 static void STLog(const char *fmt, ...) {
@@ -4556,7 +4564,7 @@ static void RunSelfTest(void) {
     SetFocus(g_hwnd);
     g_wrap = FALSE; g_showWs = FALSE; g_layoutVer++;
     RECT rc; GetClientRect(g_hwnd, &rc);
-    STLog("CEditor %s selftest\ndpi=%u client=%ldx%ld lineH=%d font=%s\n", W2U(APPVER), g_dpi, rc.right, rc.bottom, g_lineH, W2U(g_lf.lfFaceName));
+    STLog("CBEditor %s selftest\ndpi=%u client=%ldx%ld lineH=%d font=%s\n", W2U(APPVER), g_dpi, rc.right, rc.bottom, g_lineH, W2U(g_lf.lfFaceName));
     /* ---- 1. one measurement path (v1.0.1 checks) ---- */
     static const WCHAR *const lines[] = { L"テスト", L"abc def_ghi XYZ", L"長井文章をへんかんすると下線が長くなります",
                                           L"𠮷野家😀と絵文字", L"ｱｲｳ半角ｶﾅ ﾃｽﾄ mixed 全角ＡＢＣ" };
@@ -5213,6 +5221,20 @@ static void RunSelfTest(void) {
         snprintf(buf, sizeof buf, "ini round trip (%s): write=%d font=%d zoom=%d wrap=%d ws=%d linenumbers=%d", W2U(ip), wr, g_fontIdx, g_fontPt10, g_wrap, g_showWs, g_lineNo);
         STCheck(wr && g_fontIdx == 2 && g_fontPt10 == 150 && g_wrap && g_showWs && g_lineNo, buf);
         DeleteFileW(ip);
+        {   /* settings of CEditor <= 1.4.0 (editor.ini) are read while cbeditor.ini does not exist yet */
+            WCHAR np[MAX_PATH], op[MAX_PATH];
+            _snwprintf(np, MAX_PATH, L"%lsced_st_cbeditor.ini", tmp); np[MAX_PATH - 1] = 0;
+            _snwprintf(op, MAX_PATH, L"%lsced_st_editor.ini", tmp); op[MAX_PATH - 1] = 0;
+            DeleteFileW(np);
+            g_fontIdx = 4; IniWriteTo(op); g_fontIdx = 0;
+            const WCHAR *const cand[4] = { np, L"", op, L"" };
+            const WCHAR *p1 = IniPick(cand); if (p1) IniReadFrom(p1);
+            int fo = g_fontIdx; g_fontIdx = 1; IniWriteTo(np);
+            const WCHAR *p2 = IniPick(cand);
+            snprintf(buf, sizeof buf, "ini: only the old editor.ini -> read it (font %d, expect 4); after saving cbeditor.ini it wins (%s)", fo, p2 == np ? "yes" : "no");
+            STCheck(p1 == op && fo == 4 && p2 == np, buf);
+            DeleteFileW(np); DeleteFileW(op);
+        }
         g_fontIdx = f0; g_fontPt10 = z0; g_wrap = w0; g_showWs = s0; g_lineNo = l0; g_iniHaveRect = FALSE;
         BOOL bad = IniWriteTo(L"Z:\\no\\such\\dir\\x.ini");
         snprintf(buf, sizeof buf, "ini: unwritable path reports failure (-> %%APPDATA%% fallback): %d", !bad);
@@ -5255,7 +5277,7 @@ static void RunSelfTest(void) {
 /* demo (screenshots) and benchmark modes                              */
 /* ================================================================== */
 static const WCHAR kDemoText[] =
-    L"# CEditor 1.4 デモ\n"
+    L"# CBEditor 1.4 デモ\n"
     L"\n"
     L"カスタム描画のテキストエディタです。**太字**、*斜体*、***太字斜体***、~~取り消し線~~、`コード`。\n"
     L"全角スペース「　」と半角スペース「 」とタブ「\t」を含む行。\n"
@@ -5273,7 +5295,7 @@ static const WCHAR kDemoText[] =
     L"| 検索 | ✓ | 正規表現 |\n"
     L"| 置換 | ✓ | $1 参照 |\n"
     L"\n"
-    L"リンク: [CEditor](https://example.com/ \"タイトル\") と <https://example.jp>\n"
+    L"リンク: [CBEditor](https://example.com/ \"タイトル\") と <https://example.jp>\n"
     L"<!-- このコメントは表示されません -->\n"
     L"***\n"
     L"```\n"

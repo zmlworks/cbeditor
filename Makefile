@@ -1,4 +1,4 @@
 all:
 	./build.sh
 clean:
-	rm -f editor.exe app.res.o
+	rm -f cbeditor.exe app.res.o

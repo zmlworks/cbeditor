@@ -1,4 +1,21 @@
-# CEditor 1.4.0 — IME インライン変換対応の自前描画テキストエディタ (Win32 / C)
+# CBEditor 1.4.1 — IME インライン変換対応の自前描画テキストエディタ (Win32 / C)
+
+> **Note:** This repository and the account zmlworks are operated autonomously by **Grok Bot**, an AI assistant, under a human administrator. The code, documentation and releases were written by the AI.
+> このリポジトリとアカウント zmlworks は、AI アシスタント **Grok Bot** が人間の管理者のもとで自律的に運用しています。コード・説明文・リリースは AI が作成しました。
+
+**CBEditor** = *ChalkBoard Editor*。黒板のような深緑の本文 (#002218) と淡いチョーク色の文字、えんじ色の枠の配色からの名前です
+(v1.4.0 までは「CEditor」という名前でしたが、同名のプロジェクトが多いため v1.4.1 で改名しました)。
+
+English summary: a small, fast Win32 text editor written in plain C (no EDIT/RichEdit for the document) whose main goal is
+Japanese IME inline composition that behaves exactly like the standard EDIT control. Features: custom dark "chalkboard"
+title bar and colours, piece-table storage for 100 MB files, word wrap, regex find/replace, Markdown view, line numbers,
+keyboard window resizing. Windows 10/11 x64, single static exe. Built with MinGW-w64; MIT licence.
+
+![screenshot](shots/normal.png)
+
+## ダウンロード
+[Releases](https://github.com/zmlworks/cbeditor/releases) の `cbeditor-vX.Y.Z-win64.zip` に exe が入っています (インストール不要。好きなフォルダーに置いて実行)。
+v1.4.0 以前のリリースも同じ場所にあります (当時の名前 CEditor のまま、`editor.exe`)。
 
 EDIT / RichEdit コントロールを本文に一切使わず、テキストバッファと描画 (GDI) を自前で実装した
 エディタです。日本語 IME の未確定文字列の振る舞いを OS 標準 EDIT コントロールに合わせることを主目的にしています。
@@ -19,8 +36,8 @@ v1.4.0 で行番号・検索中のステータスバー・キーボードでの�
 ## ファイル
 - `editor.c` 本体 / `regex.c` `regex.h` 正規表現エンジン / `retest.c` その単体テスト
 - `app.rc` リソース (マニフェスト・バージョン 1.4.0) / `app.manifest` / `build.sh` / `Makefile`
-- `shots/` Wine でのスクリーンショットとベンチマーク・セルフテストのログ
-- `v1.0.1/` `v1.1.0/` `v1.2.0/` `v1.3.0/` 旧版一式のバックアップ
+- `shots/` Wine でのスクリーンショット / `shot.sh` その撮影スクリプト (`--demo` モード)
+- 旧版は git のタグ `v1.0.0` 〜 `v1.4.0` (コミット 1 つが 1 版)
 
 ## 外観
 - 独自描画のタイトルバー: 左に少し空白 + ファイル名。**未保存の変更があると空白部分に #00A2E8 の丸 (●)**
@@ -42,10 +59,10 @@ v1.4.0 で行番号・検索中のステータスバー・キーボードでの�
 - サロゲートペア・IVS・結合濁点・ZWJ 絵文字は1文字扱い
 - 読込: UTF-8 BOM / UTF-16LE BOM / BOM なし UTF-8 (厳密検証) → 不正なら Shift_JIS (CP932)。保存: UTF-8 (元が BOM 付きなら BOM 付き)、改行 CRLF
 - **空白文字の表示 (Ctrl+W)**: 半角スペース = 中点、全角スペース = 四角、タブ = 矢印、改行 = ↵、文書末 = [EOF]。色 #1E4A3F
-- **行番号 (Ctrl+L, v1.4.0)**: 左に行番号の帯 (背景 #3D0105、数字 #1E4A3F)。番号は論理行ごとで、折り返しの続きの行には付きません。帯の幅は桁数に合わせて自動 (2 桁以上)。テキスト表示のみ (Markdown 表示では出ません)。オン/オフは editor.ini に保存
+- **行番号 (Ctrl+L, v1.4.0)**: 左に行番号の帯 (背景 #3D0105、数字 #1E4A3F)。番号は論理行ごとで、折り返しの続きの行には付きません。帯の幅は桁数に合わせて自動 (2 桁以上)。テキスト表示のみ (Markdown 表示では出ません)。オン/オフは cbeditor.ini に保存
 - **キーボードでのサイズ変更 (Ctrl+Q, v1.4.0)**: タイトルバーに「サイズ変更: 矢印/WASD, Enter/Esc で終了」と出ます。左上は固定で、右端・下端だけが動きます (→/D 広く、←/A 狭く、↓/S 高く、↑/W 低く)。1 回 20px (DPI 換算)、Shift で 2px、押しっぱなしで連続。Ctrl を押したまま Q → 矢印でも可。作業領域 (タスクバーを除く画面) の外には広がらず、最小 360×200。Enter/Esc で終了 (このキーは消費)、その他のキーやクリックでも終了し、そのキーは普段どおり働きます。W/A/S/D の文字は入力されません (モード中は IME を一時的に外します)。最大化中は無効
 - **検索/置換**、**Markdown 表示**、**大きなファイル** (下記)
-- 設定ファイル `editor.ini` (下記)
+- 設定ファイル `cbeditor.ini` (下記)
 
 ## ショートカット
 | キー | 動作 |
@@ -136,7 +153,7 @@ Ctrl+I / Ctrl+M / Ctrl+J などが生成する制御文字 (TAB/CR/LF) は本文
 **永続バックバッファ**へ行い、スクロールは `ScrollDC` / `ScrollWindowEx` でずらして露出した行だけ描きます。
 
 ### 実測 (Wine・参考値。実機 Windows では異なります)
-100MB は各版 3 回の中央値、5MB は 1 回。詳細は `shots/bench_*.txt`。検索は大文字小文字無視・一致なしの正規表現で全文。
+100MB は各版 3 回の中央値、5MB は 1 回 (計測ログはローカルのパスを含むためリポジトリには入れていません)。検索は大文字小文字無視・一致なしの正規表現で全文。
 
 | 指標 | v1.1.0 | v1.2.0 | v1.3.0 |
 |---|---:|---:|---:|
@@ -163,13 +180,14 @@ Ctrl+I / Ctrl+M / Ctrl+J などが生成する制御文字 (TAB/CR/LF) は本文
 - 検索の高速化 (約 10 倍) の大部分は正規表現エンジンの改善 (大文字小文字無視でも先頭文字で絞り込む・折りたたみ表の事前計算) によるものです。
   格納の連続化は「編集後もコピーなしで読める」ことを保証するもので、この計測では連続化の前後で差はほとんど出ていません
 - 折り返し時、400 行以下は同期で正確な表示行数、それより大きい文書は未知行を 1 行と数えたあとアイドルで正確化します
-- v1.4.0 (同じ 100MB、内蔵ベンチ 1 回、Wine): 読込 515 ms、ピーク WS 208 MB、全文検索 129 ms、中央での 1 文字入力 2.49 ms、no-wrap PageDown 3.09 ms。v1.3.0 と同程度 (行番号・ステータスバーはオフ/閉じた状態。`shots/bench_100mb_v140_run1.txt`)
+- v1.4.0 (同じ 100MB、内蔵ベンチ 1 回、Wine): 読込 515 ms、ピーク WS 208 MB、全文検索 129 ms、中央での 1 文字入力 2.49 ms、no-wrap PageDown 3.09 ms。v1.3.0 と同程度 (行番号・ステータスバーはオフ/閉じた状態)
 
-## 設定ファイル (editor.ini)
-exe と同じフォルダーの `editor.ini` に保存します (終了時)。そこが書き込めない場合 (Program Files・読み取り専用メディアなど) は `%APPDATA%\CEditor\editor.ini` に保存します。読込は exe 側 → APPDATA 側の順。
+## 設定ファイル (cbeditor.ini)
+exe と同じフォルダーの `cbeditor.ini` に保存します (終了時)。そこが書き込めない場合 (Program Files・読み取り専用メディアなど) は `%APPDATA%\CBEditor\cbeditor.ini` に保存します。読込は exe 側 → APPDATA 側の順。
     [Editor]  Font=0..4  Zoom=110 (pt×10)  Wrap=0/1  Whitespace=0/1  LineNumbers=0/1
     [Find]    MatchCase=0/1
     [Window]  X Y W H (通常時の位置・サイズ)  Max=0/1
+**旧名からの引き継ぎ (v1.4.1)**: `cbeditor.ini` がどちらにも無い場合は、CEditor 時代の `editor.ini` (exe と同じフォルダー → `%APPDATA%\CEditor\editor.ini` の順) を読み、終了時に `cbeditor.ini` として保存します。古い `editor.ini` は消さずに残します。
 保存された位置がどのモニターにも入らない場合 (モニター構成の変更など) は既定位置で開きます。
 
 ## IME 処理の要点
@@ -190,10 +208,10 @@ exe と同じフォルダーの `editor.ini` に保存します (終了時)。�
 TSF ベースの新しい MS-IME も、Windows が提供する IMM32 互換レイヤ経由で上記メッセージを送ってくるため、この経路で動作します (TSF の ITextStoreACP は未実装)。
 
 ## 自己診断モード (デバッグ用)
-    editor.exe --selftest C:\temp\st.txt
+    cbeditor.exe --selftest C:\temp\st.txt
 起動後に自動検証してログに `[OK]/[NG]` と `RESULT: PASS/FAIL (n checks, m failures)` を書き出します。
 **ログファイルを開けない場合 (フォルダーが無い等) はエラーのメッセージ ボックスを表示**し、テストは続行して最後に結果をメッセージ ボックスで表示します。
-検証内容 (v1.4.0 で 122 項目。Wine で RESULT: PASS):
+検証内容 (v1.4.1 で 123 項目。Wine で RESULT: PASS):
 - 幅辞書と GetTextExtentPoint32 の一致 (複数フォント × 96/144 DPI)、描画 lpDx と計測の一致、タブ幅、キャレット/ヒットテスト
 - 未確定文字列の終端・GCS_CURSORPOS・IMR_QUERYCHARPOSITION・候補窓 CFS_EXCLUDE (通常 DPI と 144 DPI 換算フォント)
 - スクロールバー表示条件、折り返し幅・End アフィニティ・↓ が表示行単位
@@ -240,7 +258,7 @@ TSF ベースの新しい MS-IME も、Windows が提供する IMM32 互換レ�
 31. Ctrl+M → Markdown 表示 (枠が #7B5E86)。見出し・強調・引用・リスト・表・リンク・コメント非表示を確認。Esc / Ctrl+M で戻る
 32. Ctrl+T 折り返し、Ctrl+W 空白文字 (半角/全角スペースが区別できる、タブ、改行、[EOF])
 33. Ctrl+; / Ctrl+- / Ctrl+0 / Ctrl+ホイール (JIS キーボードの「;」キーで拡大できること)
-34. 終了して再起動 → 位置・サイズ・最大化・フォント・ズーム・折り返し・空白表示が復元。exe を Program Files など書けない場所に置いても終了時にエラーが出ず `%APPDATA%\CEditor\editor.ini` に保存される
+34. 終了して再起動 → 位置・サイズ・最大化・フォント・ズーム・折り返し・空白表示が復元。exe を Program Files など書けない場所に置いても終了時にエラーが出ず `%APPDATA%\CBEditor\cbeditor.ini` に保存される
 35. 100MB 程度のファイルを開いてスクロール・入力・検索・保存 (数秒以内)
 
 ### v1.4.0 の新機能
@@ -250,15 +268,20 @@ TSF ベースの新しい MS-IME も、Windows が提供する IMM32 互換レ�
 39. Ctrl+F → 下端にステータスバー (行・列・「k / N 件」)。F3 で k が進む。一致なしで「一致なし」。100MB ファイルで「… 件」から件数に変わるまで入力が引っかからない。Esc で消えて本文が下まで戻る
 40. 行間が広くなっていること、下線・キャレット・選択・クリック位置がずれないこと、タイトルバーと 1 行目の間に余白
 
+### v1.4.1 (改名)
+41. 旧 `editor.exe` と同じフォルダーに `cbeditor.exe` を置いて起動 → フォント・ズーム・折り返し・行番号・位置などの設定が引き継がれ、終了後に `cbeditor.ini` ができる (`editor.ini` は残る)。.txt の関連付けを `cbeditor.exe` に付け直す
+
 ## 変更履歴
+- v1.4.1: 名称を CEditor → **CBEditor** に変更 (アプリ名・ウィンドウ クラス名・バージョン情報・exe 名 `cbeditor.exe`・設定ファイル `cbeditor.ini`・`%APPDATA%\CBEditor`)。旧 `editor.ini` からの設定の引き継ぎ。機能の変更なし。MIT ライセンスで公開。セルフテスト 123 項目
 - v1.4.0: 検索/置換欄の IME 変換を欄の配色でインライン表示、行番号 (Ctrl+L)、キーボードでのサイズ変更 (Ctrl+Q)、検索中のステータスバー (位置・件数、アイドル時に計数)、行間約 18% 増とタイトル下の余白。セルフテスト 122 項目
 - v1.3.0: アイドル時の行単位の連続化 (コンパクション)・長い行の内部チャンク化・未使用メモリの返却、保存時の統合を廃止、分割読み込み (ピークメモリ削減)、行メタデータの縮小、行インデックス更新の部分化、Undo 記録の集約、正規表現の大文字小文字無視検索の高速化。セルフテスト 82 項目
 - v1.2.0: ギャップバッファをピーステーブルに置換。幅辞書・行メタデータ キャッシュ・アイドル先読み・永続バックバッファ スクロール。超長行・折り返し大量行の応答を改善。セルフテスト 74 項目
 - v1.1.0: 独自タイトルバー (未保存マーク・スナップ レイアウト・角丸)、配色変更、editor.ini、右クリック メニュー、トリプルクリック、Ctrl+N/S/Shift+S/I/F/H/M/T/W/;/-/0、検索・置換 (独自正規表現)、折り返し、空白文字表示、Markdown 表示、大きなファイル対応 (差分行インデックス・見える範囲だけ描画)、セルフテスト拡張 (ログを開けない時のメッセージ表示)
 - v1.0.1: キャレット・変換下線・候補窓が右にずれる不具合を修正 (GetTextExtentExPointW の nMaxExtent=0 + lpnFit で部分幅配列が未設定だった)。スクロールバーを「はみ出した時だけ表示」に
+- v1.0.0: 最初の版。ギャップバッファ + GDI ダブルバッファの自前描画、EDIT 互換のインライン IME 変換 (下線・文節・候補窓・再変換・IMR_*)
 
 ## 既知の制限・リスク
-- 実機 Windows での確認が必要です (ビルド・テストは Linux + Wine。独自タイトルバーの見た目、スナップ レイアウト、角丸、ダーク スクロールバー、DWM の枠色は Wine では再現されないため未確認)
+- 実機 Windows での確認が必要です (ビルド・テストは Linux + Wine。Wine のテストでは日本語フォントとして Noto Sans CJK を MS Gothic などの代わりに割り当てています。フォントはリポジトリ・配布物に含みません。独自タイトルバーの見た目、スナップ レイアウト、角丸、ダーク スクロールバー、DWM の枠色は Wine では再現されないため未確認)
   - Wine で独自タイトルバーを表示するには `HKCU\Software\Wine\X11 Driver` の `Decorated=N` が必要です (この設定ではメッセージ ボックスや一部メニューが黒く描画される Wine 側の問題があります)
 - 超長行は必要な範囲だけ測り、残りはアイドルで進めます。ただし折り返し ON で超長行を全面表示すると行分割に時間がかかります
 - 折り返し時、400 行超は最初は未知行を 1 行と数え、アイドルで正確な表示行数に更新します (変換中の余分な表示行は合計に入りません)
@@ -272,3 +295,6 @@ TSF ベースの新しい MS-IME も、Windows が提供する IMM32 互換レ�
 - 候補窓の最終的な配置は IME 実装依存
 - v1.4.0 の検索欄の変換表示は Wine では本物の IME で確認できないため、セルフテストの合成状態 (文節・属性・カーソルを直接設定) で描画とキャレットだけを検証しています。実機の Microsoft IME で要確認
 - Ctrl+Q のサイズ変更中は、W/A/S/D をキーとして受け取るため IME を一時的に外し、終了時に戻します
+
+## ライセンス
+MIT License © 2026 zmlworks (`LICENSE`)。外部のコード・フォント・画像は含みません (正規表現エンジンも自作)。
