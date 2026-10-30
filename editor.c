@@ -31,7 +31,7 @@
 #include "regex.h"
 
 #define APPNAME   L"CBEditor"
-#define APPVER    L"1.4.1"
+#define APPVER    L"1.4.2"
 #define CLS_FRAME L"CBEditorFrame"
 #define CLS_TEXT  L"CBEditorText"
 #define CLS_FIND  L"CBEditorFind"
@@ -82,7 +82,23 @@ static const WCHAR *const kFonts[] = { L"MS Gothic", L"BIZ UDGothic", L"Meiryo",
 static const WCHAR *const kFontLabels[] = { L"MS ゴシック (等幅)", L"BIZ UDゴシック (等幅)", L"メイリオ", L"Yu Gothic UI", L"Consolas" };
 #define NFONTS ((int)(sizeof(kFonts) / sizeof(kFonts[0])))
 
-static void NoMem(void) { MessageBoxW(NULL, L"メモリ不足です。", APPNAME, MB_ICONERROR); ExitProcess(1); }
+static BOOL RecoveryWrite(void);
+static const WCHAR *RecoveryWhere(void);
+static LONG WINAPI NoMemCrash(EXCEPTION_POINTERS *e) { (void)e; ExitProcess(1); return EXCEPTION_EXECUTE_HANDLER; }
+/* out of memory: write the unsaved text to a recovery file once (no heap use), then exit */
+static void NoMem(void) {
+    static LONG once;
+    BOOL saved = FALSE;
+    if (InterlockedExchange(&once, 1) == 0) {
+        SetUnhandledExceptionFilter(NoMemCrash);   /* a broken document while writing: just exit */
+        saved = RecoveryWrite();
+    }
+    static WCHAR msg[MAX_PATH * 4 + 160];
+    if (saved) _snwprintf(msg, sizeof msg / sizeof msg[0], L"メモリ不足のため終了します。\n\n保存していない内容を次のファイルに退避しました。次に起動したときに復元できます。\n%ls", RecoveryWhere());
+    else wcscpy(msg, L"メモリ不足です。");
+    msg[sizeof msg / sizeof msg[0] - 1] = 0;
+    MessageBoxW(NULL, msg, APPNAME, MB_ICONERROR); ExitProcess(1);
+}
 static void *xrealloc(void *p, size_t n) {
     void *q = realloc(p, n ? n : 1);
     if (!q) NoMem();
@@ -1238,12 +1254,187 @@ static DWORD CharCut(const BYTE *b, DWORD m, UINT cp) {   /* start of the last c
     return last;
 }
 static BOOL g_loadQuiet;
+static DWORD g_loadHdr;                     /* > 0: bytes of a recovery-file header to skip (see Recovery) */
+/* ================================================================== */
+/* recovery file: unsaved text kept when Windows shuts down or memory runs out */
+/* ================================================================== */
+/* cbeditor-<pid>.cbrec in the settings folder (next to the exe, else %APPDATA%\CBEditor). UTF-16LE: BOM,
+   "CBEditorRecovery1\t<encoding>\t<original path>\n", then the text. A file whose process is gone is
+   offered at the next start (open / delete / later). A restored file is kept until its text is saved or
+   discarded, so a second crash does not lose it. Writing uses no heap, so it also works out of memory. */
+#define REC_MAGIC L"CBEditorRecovery1"
+#define REC_cbeditor   L"cbeditor-"
+static BOOL g_recOn;                        /* off in the self test */
+static WCHAR g_recDir[2][MAX_PATH * 4];     /* exe folder, %APPDATA%\CBEditor */
+static WCHAR g_recFile[MAX_PATH * 4];       /* this session's file, once written */
+static WCHAR g_recClaimed[MAX_PATH * 4];    /* the restored file */
+static unsigned g_recVer;                   /* g_docVer when g_recFile was written */
+static WCHAR g_recBuf[32768];
+static void RecoveryInit(void) {
+    DWORD n = GetModuleFileNameW(NULL, g_recDir[0], MAX_PATH * 4);
+    WCHAR *s = n && n < MAX_PATH * 4 ? wcsrchr(g_recDir[0], L'\\') : NULL;
+    if (s) *s = 0; else g_recDir[0][0] = 0;
+    n = GetEnvironmentVariableW(L"APPDATA", g_recDir[1], MAX_PATH * 3);
+    if (n == 0 || n >= MAX_PATH * 3) g_recDir[1][0] = 0; else wcscat(g_recDir[1], L"\\CBEditor");
+    g_recOn = TRUE;
+}
+static const WCHAR *RecoveryWhere(void) { return g_recFile; }
+static BOOL RecPut(HANDLE f, const void *p, DWORD n) { DWORD w; return WriteFile(f, p, n, &w, NULL) && w == n; }
+static BOOL RecoveryWriteTo(const WCHAR *dir, const WCHAR *name, WCHAR *out) {
+    static WCHAR fin[MAX_PATH * 4], tmp[MAX_PATH * 4 + 8];
+    if (!dir[0]) return FALSE;
+    _snwprintf(fin, MAX_PATH * 4, L"%ls\\%ls", dir, name); fin[MAX_PATH * 4 - 1] = 0;
+    _snwprintf(tmp, MAX_PATH * 4 + 8, L"%ls.tmp", fin); tmp[MAX_PATH * 4 + 7] = 0;
+    HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    int hn = _snwprintf(g_recBuf, 32768, L"\xFEFF" REC_MAGIC L"\t%d\t%ls\n", g_enc, g_path);
+    BOOL ok = hn > 0 && hn < 32768 && RecPut(f, g_recBuf, (DWORD)hn * sizeof(WCHAR));
+    size_t len = DocLen(), p = 0;
+    while (ok && p < len) {
+        size_t n = len - p > 32768 ? 32768 : len - p;
+        DocGet(p, n, g_recBuf); ok = RecPut(f, g_recBuf, (DWORD)(n * sizeof(WCHAR))); p += n;
+    }
+    ok = ok && FlushFileBuffers(f);
+    CloseHandle(f);
+    if (ok) ok = MoveFileExW(tmp, fin, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!ok) { DeleteFileW(tmp); return FALSE; }
+    if (out) wcscpy(out, fin);
+    return TRUE;
+}
+static BOOL RecoveryWrite(void) {           /* this session's unsaved text -> cbeditor-<pid>.cbrec */
+    if (!g_recOn || !g_modified) return FALSE;
+    static WCHAR name[64], prev[MAX_PATH * 4];
+    _snwprintf(name, 64, REC_cbeditor L"%lu.cbrec", GetCurrentProcessId()); name[63] = 0;
+    wcscpy(prev, g_recFile);
+    for (int i = 0; i < 2; i++) {
+        if (i == 1 && g_recDir[1][0]) CreateDirectoryW(g_recDir[1], NULL);
+        if (RecoveryWriteTo(g_recDir[i], name, g_recFile)) {
+            if (prev[0] && _wcsicmp(prev, g_recFile)) DeleteFileW(prev);
+            g_recVer = g_docVer;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+static void RecoveryDone(void) {            /* the text was saved or discarded */
+    if (g_recFile[0]) { DeleteFileW(g_recFile); g_recFile[0] = 0; }
+    if (g_recClaimed[0]) { DeleteFileW(g_recClaimed); g_recClaimed[0] = 0; }
+}
+/* header of a recovery file: encoding and original path; returns the header size in bytes (0 = not one) */
+static DWORD RecoveryHeader(const WCHAR *file, int *enc, WCHAR *orig, FILETIME *ft) {
+    HANDLE f = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    WCHAR b[MAX_PATH * 4 + 64]; DWORD rd = 0;
+    BOOL ok = ReadFile(f, b, sizeof b - sizeof(WCHAR), &rd, NULL);
+    if (ft && !GetFileTime(f, NULL, NULL, ft)) memset(ft, 0, sizeof *ft);
+    CloseHandle(f);
+    if (!ok) return 0;
+    size_t n = rd / sizeof(WCHAR), ml = wcslen(REC_MAGIC); b[n] = 0;
+    if (n < ml + 3 || b[0] != 0xFEFF || wcsncmp(b + 1, REC_MAGIC, ml) || b[1 + ml] != L'\t') return 0;
+    WCHAR *e = b + 2 + ml, *nl = wcschr(e, L'\n'), *t = wcschr(e, L'\t');
+    if (!nl || !t || t > nl) return 0;
+    *enc = _wtoi(e); if (*enc < 0 || *enc > 3) *enc = 0;
+    size_t pl = (size_t)(nl - t - 1); if (pl >= MAX_PATH * 4) return 0;
+    memcpy(orig, t + 1, pl * sizeof(WCHAR)); orig[pl] = 0;
+    return (DWORD)((nl + 1 - b) * sizeof(WCHAR));
+}
+static BOOL LoadFile(const WCHAR *path);
+static BOOL RecoveryRestore(const WCHAR *file) {   /* opens a recovery file as the unsaved original */
+    int enc = 0; WCHAR orig[MAX_PATH * 4];
+    DWORD hb = RecoveryHeader(file, &enc, orig, NULL);
+    if (!hb) return FALSE;
+    g_loadHdr = hb; BOOL ok = LoadFile(file); g_loadHdr = 0;
+    if (!ok) return FALSE;
+    wcscpy(g_path, orig); g_enc = enc; g_modified = TRUE;
+    wcsncpy(g_recClaimed, file, MAX_PATH * 4 - 1);
+    UpdateTitle();
+    return TRUE;
+}
+static BOOL PidAlive(DWORD pid) {           /* another running CBEditor with this process id */
+    if (pid == GetCurrentProcessId()) return FALSE;   /* at start: left by an ended process that had our id */
+    HANDLE p = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return GetLastError() == ERROR_ACCESS_DENIED;
+    BOOL alive = WaitForSingleObject(p, 0) == WAIT_TIMEOUT;
+    if (alive) {                            /* the id may have been reused by another program */
+        WCHAR a[MAX_PATH * 4], me[MAX_PATH * 4]; DWORD n = MAX_PATH * 4;
+        if (QueryFullProcessImageNameW(p, 0, a, &n) && GetModuleFileNameW(NULL, me, MAX_PATH * 4)) {
+            const WCHAR *x = wcsrchr(a, L'\\'), *y = wcsrchr(me, L'\\');
+            alive = !_wcsicmp(x ? x + 1 : a, y ? y + 1 : me);
+        }
+    }
+    CloseHandle(p);
+    return alive;
+}
+static BOOL RecoveryClaim(const WCHAR *file, WCHAR *out) {   /* rename to this process, so other windows skip it */
+    static unsigned k;
+    WCHAR dir[MAX_PATH * 4]; wcsncpy(dir, file, MAX_PATH * 4 - 1); dir[MAX_PATH * 4 - 1] = 0;
+    WCHAR *s = wcsrchr(dir, L'\\'); if (s) *s = 0; else wcscpy(dir, L".");
+    for (int i = 0; i < 100; i++) {
+        _snwprintf(out, MAX_PATH * 4, L"%ls\\" REC_cbeditor L"%lu-%u.cbrec", dir, GetCurrentProcessId(), ++k); out[MAX_PATH * 4 - 1] = 0;
+        if (MoveFileExW(file, out, 0)) return TRUE;
+        DWORD e = GetLastError();
+        if (e != ERROR_ALREADY_EXISTS && e != ERROR_FILE_EXISTS) return FALSE;
+    }
+    return FALSE;
+}
+/* at start: --recover <file> (from another window), else offer the files left by ended sessions */
+static void RecoveryStartup(const WCHAR *arg) {
+    if (!g_recOn) return;
+    WCHAR c[MAX_PATH * 4];
+    if (arg) {
+        if (!RecoveryClaim(arg, c) || !RecoveryRestore(c)) MessageBoxW(g_frame, L"退避ファイルを復元できませんでした。", APPNAME, MB_ICONERROR);
+        return;
+    }
+    BOOL usedHere = FALSE;
+    for (int d = 0; d < 2; d++) {
+        if (!g_recDir[d][0] || (d == 1 && !_wcsicmp(g_recDir[0], g_recDir[1]))) continue;
+        WCHAR pat[MAX_PATH * 4 + 32]; _snwprintf(pat, sizeof pat / sizeof pat[0], L"%ls\\" REC_cbeditor L"*.cbrec", g_recDir[d]); pat[sizeof pat / sizeof pat[0] - 1] = 0;
+        static WCHAR names[32][MAX_PATH]; int nn = 0;   /* listed first: claiming renames files in this folder */
+        WIN32_FIND_DATAW fd; HANDLE fh = FindFirstFileW(pat, &fd);
+        if (fh == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            DWORD pid = wcstoul(fd.cFileName + wcslen(REC_cbeditor), NULL, 10);
+            if (!PidAlive(pid)) wcscpy(names[nn++], fd.cFileName);   /* skip: still open in another window */
+        } while (nn < 32 && FindNextFileW(fh, &fd));
+        FindClose(fh);
+        for (int q = 0; q < nn; q++) {
+            WCHAR f[MAX_PATH * 4]; _snwprintf(f, MAX_PATH * 4, L"%ls\\%ls", g_recDir[d], names[q]); f[MAX_PATH * 4 - 1] = 0;
+            if (!RecoveryClaim(f, c)) continue;
+            int enc; WCHAR orig[MAX_PATH * 4]; FILETIME ft, lt; SYSTEMTIME st; memset(&st, 0, sizeof st);
+            if (!RecoveryHeader(c, &enc, orig, &ft)) continue;
+            if (FileTimeToLocalFileTime(&ft, &lt)) FileTimeToSystemTime(&lt, &st);
+            WCHAR msg[MAX_PATH * 4 + 400];
+            _snwprintf(msg, sizeof msg / sizeof msg[0],
+                       L"保存しないまま終了したときの内容が残っています (%04u-%02u-%02u %02u:%02u)。\n\n元のファイル: %ls\n\n"
+                       L"はい: 開いて復元する\nいいえ: 破棄する (退避ファイルを削除)\nキャンセル: 今はしない (次回また確認)",
+                       st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, orig[0] ? orig : L"(無題)");
+            msg[sizeof msg / sizeof msg[0] - 1] = 0;
+            int r = MessageBoxW(g_frame, msg, APPNAME, MB_YESNOCANCEL | MB_ICONWARNING);
+            if (r == IDNO) DeleteFileW(c);
+            else if (r == IDYES) {
+                if (!usedHere && !g_path[0] && !g_modified && DocLen() == 0) {   /* this window is empty: restore here */
+                    if (RecoveryRestore(c)) usedHere = TRUE;
+                    else MessageBoxW(g_frame, L"退避ファイルを復元できませんでした。", APPNAME, MB_ICONERROR);
+                } else {                    /* otherwise in a new window */
+                    WCHAR exe[MAX_PATH * 4], cmd[MAX_PATH * 8 + 64];
+                    GetModuleFileNameW(NULL, exe, MAX_PATH * 4);
+                    _snwprintf(cmd, sizeof cmd / sizeof cmd[0], L"\"%ls\" --recover \"%ls\"", exe, c); cmd[sizeof cmd / sizeof cmd[0] - 1] = 0;
+                    STARTUPINFOW si; PROCESS_INFORMATION pi; memset(&si, 0, sizeof si); si.cb = sizeof si;
+                    if (CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+                    else MessageBoxW(g_frame, L"復元用のウィンドウを開けませんでした。", APPNAME, MB_ICONERROR);
+                }
+            }
+        }
+    }
+}
 /* The file is read in chunks and each chunk is decoded straight into the original-text buffer, so the
    raw bytes are never held as a whole. UTF-8 BOM / UTF-16LE BOM / strict UTF-8, else Shift_JIS (CP932). */
 static BOOL LoadFile(const WCHAR *path) {
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (f == INVALID_HANDLE_VALUE) { if (!g_loadQuiet) MessageBoxW(g_frame, L"ファイルを開けません。", APPNAME, MB_ICONERROR); return FALSE; }
-    LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(f, &sz)) { CloseHandle(f); MessageBoxW(g_frame, L"読み込みに失敗しました。", APPNAME, MB_ICONERROR); return FALSE; }
     if (sz.QuadPart > 0x7FFFFFF0LL) { CloseHandle(f); MessageBoxW(g_frame, L"ファイルが大きすぎます (2GB 以上)。", APPNAME, MB_ICONERROR); return FALSE; }
     HCURSOR oc = SetCursor(LoadCursorW(NULL, IDC_WAIT));
     DWORD n = (DWORD)sz.QuadPart, rd = 0, skip = 0;
@@ -1252,7 +1443,11 @@ static BOOL LoadFile(const WCHAR *path) {
     int enc = 0;
     if (n >= 3 && h[0] == 0xEF && h[1] == 0xBB && h[2] == 0xBF) { enc = 1; skip = 3; }
     else if (n >= 2 && h[0] == 0xFF && h[1] == 0xFE) { enc = 3; skip = 2; }
-    size_t cap = enc == 3 ? (n - 2) / 2 : n, wn = 0;   /* UTF-8 / CP932: at most one unit per byte */
+    if (g_loadHdr) {                        /* recovery file: UTF-16LE text after its header line */
+        if (enc != 3 || g_loadHdr > n) { CloseHandle(f); MessageBoxW(g_frame, L"読み込みに失敗しました。", APPNAME, MB_ICONERROR); return FALSE; }
+        skip = g_loadHdr;
+    }
+    size_t cap = enc == 3 ? (n - skip) / 2 : n, wn = 0;   /* UTF-8 / CP932: at most one unit per byte */
     WCHAR *w = OrgAlloc(cap); BYTE *b = malloc(LOAD_CHUNK + 8);
     if (!w || !b) { free(b); OrgFree(w); CloseHandle(f); SetCursor(oc); MessageBoxW(g_frame, L"メモリ不足です。", APPNAME, MB_ICONERROR); return FALSE; }
     UINT cp = CP_UTF8; DWORD flags = enc == 0 ? MB_ERR_INVALID_CHARS : 0;
@@ -1291,9 +1486,65 @@ static BOOL LoadFile(const WCHAR *path) {
     UpdateTitle(); Refresh(TRUE);
     return TRUE;
 }
+/* Saving never touches the original until the new text is complete on disk: it is written to a
+   temporary file in the same folder, flushed, then swapped in with one rename (MoveFileEx). */
+static WCHAR g_saveErr[512];                /* self test: the last save error instead of a message box */
+static void SaveErr(const WCHAR *m) {
+    if (g_selftest) { wcsncpy(g_saveErr, m, 511); g_saveErr[511] = 0; return; }
+    MessageBoxW(g_frame, m, APPNAME, MB_ICONERROR);
+}
+static void SaveFail(DWORD e, int stage, BOOL hadOrig) {   /* stage 0 temp file, 1 writing, 2 replacing */
+    const WCHAR *m;
+    switch (e) {
+    case ERROR_ACCESS_DENIED:
+        m = stage == 2 ? L"ファイルを置き換えられないため保存できません (アクセスが拒否されました)。\nほかのアプリが使用中か、このファイルを変更する権限がありません。"
+                       : L"このフォルダーには書き込めないため保存できません (アクセスが拒否されました)。\n「名前を付けて保存」で別の場所に保存してください。";
+        break;
+    case ERROR_SHARING_VIOLATION: case ERROR_LOCK_VIOLATION: case ERROR_USER_MAPPED_FILE:
+        m = L"ほかのアプリがこのファイルを使用中のため保存できません。\nそのアプリを閉じてから、もう一度保存してください。"; break;
+    case ERROR_DISK_FULL: case ERROR_HANDLE_DISK_FULL:
+        m = L"ディスクの空き容量が足りないため保存できません。"; break;
+    case ERROR_WRITE_PROTECT:
+        m = L"書き込み禁止のドライブのため保存できません。"; break;
+    default:
+        m = L"保存に失敗しました。"; break;
+    }
+    WCHAR b[512]; _snwprintf(b, 512, L"%ls%ls", m, hadOrig ? L"\n\n元のファイルは変更されていません。" : L""); b[511] = 0;
+    SaveErr(b);
+}
+static void RecoveryDone(void);
 static BOOL SaveFile(const WCHAR *path) {
-    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE) { MessageBoxW(g_frame, L"保存できません (書き込み不可)。", APPNAME, MB_ICONERROR); return FALSE; }
+    WCHAR real[MAX_PATH * 4], dir[MAX_PATH * 4], tmp[MAX_PATH * 4 + 32];
+    DWORD fl = GetFullPathNameW(path, MAX_PATH * 4, real, NULL);
+    if (!fl || fl >= MAX_PATH * 4) { wcsncpy(real, path, MAX_PATH * 4 - 1); real[MAX_PATH * 4 - 1] = 0; }
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    BOOL exists = GetFileAttributesExW(real, GetFileExInfoStandard, &fa);
+    if (exists && (fa.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && !(fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        /* a symbolic link: replace the file it points to, not the link itself */
+        HANDLE l = CreateFileW(real, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        DWORD n = 0;
+        if (l != INVALID_HANDLE_VALUE) { n = GetFinalPathNameByHandleW(l, dir, MAX_PATH * 4, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS); CloseHandle(l); }
+        if (!n || n >= MAX_PATH * 4) { SaveErr(L"リンク先のファイルが見つからないため保存できません。"); return FALSE; }
+        wcscpy(real, dir);
+        exists = GetFileAttributesExW(real, GetFileExInfoStandard, &fa);
+    }
+    if (exists && (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) { SaveErr(L"同じ名前のフォルダーがあるため保存できません。"); return FALSE; }
+    if (exists && (fa.dwFileAttributes & FILE_ATTRIBUTE_READONLY)) {
+        SaveErr(L"読み取り専用のファイルのため上書きできません。\n「名前を付けて保存」で別の名前で保存するか、ファイルのプロパティで「読み取り専用」を外してください。");
+        return FALSE;
+    }
+    /* the temporary file goes in the same folder, so the final rename stays on one drive */
+    wcscpy(dir, real);
+    WCHAR *sl = wcsrchr(dir, L'\\'), *sl2 = wcsrchr(dir, L'/'); if (sl2 > sl) sl = sl2;
+    if (sl) sl[1] = 0; else dir[0] = 0;
+    HANDLE f = INVALID_HANDLE_VALUE; DWORD err = 0;
+    for (unsigned i = 0; i < 64 && f == INVALID_HANDLE_VALUE; i++) {
+        _snwprintf(tmp, sizeof tmp / sizeof tmp[0], L"%ls~cbe%04lx%04lx.tmp", dir, GetCurrentProcessId() & 0xFFFF, (GetTickCount() + i * 7919) & 0xFFFF);
+        tmp[sizeof tmp / sizeof tmp[0] - 1] = 0;
+        f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f == INVALID_HANDLE_VALUE && (err = GetLastError()) != ERROR_FILE_EXISTS && err != ERROR_ALREADY_EXISTS) break;
+    }
+    if (f == INVALID_HANDLE_VALUE) { SaveFail(err, 0, exists); return FALSE; }
     int enc = (g_enc == 1) ? 1 : 0;
     BOOL ok = TRUE; DWORD wr;
     if (enc == 1) { static const BYTE bom[3] = { 0xEF, 0xBB, 0xBF }; ok = WriteFile(f, bom, 3, &wr, NULL) && wr == 3; }
@@ -1311,11 +1562,18 @@ static BOOL SaveFile(const WCHAR *path) {
         ok = bn > 0 && WriteFile(f, u, (DWORD)bn, &wr, NULL) && wr == (DWORD)bn;
         p += n;
     }
+    if (!ok) err = GetLastError();
     free(t); free(c); free(u);
+    if (ok && !FlushFileBuffers(f)) { ok = FALSE; err = GetLastError(); }
+    if (ok && exists) SetFileTime(f, &fa.ftCreationTime, NULL, NULL);   /* keep the original's creation time */
     CloseHandle(f);
-    if (!ok) { MessageBoxW(g_frame, L"保存に失敗しました。", APPNAME, MB_ICONERROR); return FALSE; }
+    if (ok && exists)   /* keep hidden / system / not-indexed; mark as changed for backups */
+        SetFileAttributesW(tmp, (fa.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED)) | FILE_ATTRIBUTE_ARCHIVE);
+    if (ok && !MoveFileExW(tmp, real, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { err = GetLastError(); DeleteFileW(tmp); SaveFail(err, 2, exists); return FALSE; }
+    if (!ok) { DeleteFileW(tmp); SaveFail(err, 1, exists); return FALSE; }
     g_enc = enc; g_modified = FALSE;
     if (path != g_path) wcsncpy(g_path, path, sizeof g_path / sizeof g_path[0] - 1);
+    RecoveryDone();
     UpdateTitle();
     return TRUE;
 }
@@ -1338,10 +1596,11 @@ static BOOL DoSave(void) {
     return SaveFile(g_path);
 }
 static BOOL ConfirmDiscard(void) {
-    if (!g_modified) return TRUE;
+    if (!g_modified) { RecoveryDone(); return TRUE; }
     int r = MessageBoxW(g_frame, L"変更内容を保存しますか?", APPNAME, MB_YESNOCANCEL | MB_ICONQUESTION);
     if (r == IDCANCEL) return FALSE;
     if (r == IDYES) return g_path[0] ? SaveFile(g_path) : DoSaveAs();
+    RecoveryDone();                         /* discarded */
     return TRUE;
 }
 static void DoOpen(void) {
@@ -4090,6 +4349,17 @@ static LRESULT CALLBACK FrameProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         CompleteComposition();
         if (ConfirmDiscard()) { SaveIni(); DestroyWindow(h); }
         return 0;
+    case WM_QUERYENDSESSION:                /* Windows is shutting down / restarting: never block it with a */
+        if (g_modified && g_recOn) {        /* question (it may be ended anyway); keep the text in a recovery file */
+            CompleteComposition();
+            ShutdownBlockReasonCreate(h, L"保存していない内容を退避しています");
+            RecoveryWrite();
+            ShutdownBlockReasonDestroy(h);
+        }
+        return TRUE;
+    case WM_ENDSESSION:
+        if (wp && g_modified && g_recOn && (!g_recFile[0] || g_recVer != g_docVer)) RecoveryWrite();
+        return 0;
     case WM_APP + 1:
         if (g_bench) RunBench(); else if (g_demo[0]) RunDemo(); else RunSelfTest();
         return 0;
@@ -4335,6 +4605,88 @@ static int GutterInk(const DWORD *px, int y0, int y1, int *maxG) {   /* non-gutt
             if (c != PxOf(C_FRAME)) { n++; if (maxG && (int)((c >> 8) & 255) > *maxG) *maxG = (int)((c >> 8) & 255); }
         }
     return n;
+}
+/* ---- v1.4.2: atomic save, recovery file ---- */
+static int STDirCount(const WCHAR *d) {    /* entries in a folder, without . and .. */
+    WCHAR pat[MAX_PATH]; _snwprintf(pat, MAX_PATH, L"%ls\\*", d); pat[MAX_PATH - 1] = 0;
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd); int n = 0;
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    do if (wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L"..")) n++; while (FindNextFileW(h, &fd));
+    FindClose(h); return n;
+}
+static BOOL STPutFile(const WCHAR *p, const char *b) {
+    HANDLE f = CreateFileW(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    DWORD w, n = (DWORD)strlen(b); BOOL ok = WriteFile(f, b, n, &w, NULL) && w == n; CloseHandle(f); return ok;
+}
+static BOOL STFileIs(const WCHAR *p, const char *b, size_t n) {
+    size_t l; char *r = ReadAll(p, &l); BOOL ok = r && l == n && !memcmp(r, b, n); free(r); return ok;
+}
+static void STSave(char *buf) {
+    const size_t B = 512;
+    WCHAR tmp[MAX_PATH], d[MAX_PATH], p[MAX_PATH], q[MAX_PATH * 4], keep[MAX_PATH * 4];
+    GetTempPathW(MAX_PATH, tmp); wcscpy(keep, g_path); int e0 = g_enc;
+    _snwprintf(d, MAX_PATH, L"%lscbe_st_atomic", tmp); d[MAX_PATH - 1] = 0;
+    _snwprintf(p, MAX_PATH, L"%ls\\a.txt", d); p[MAX_PATH - 1] = 0;
+    CreateDirectoryW(d, NULL);
+    /* overwrite a hidden file: new bytes, BOM kept, attribute and creation time kept, no temporary file left */
+    STPutFile(p, "old\r\n");
+    FILETIME ct = { 0x12345000u, 0x01D00000u };
+    { HANDLE f = CreateFileW(p, FILE_WRITE_ATTRIBUTES, 0, NULL, OPEN_EXISTING, 0, NULL); if (f != INVALID_HANDLE_VALUE) { SetFileTime(f, &ct, NULL, NULL); CloseHandle(f); } }
+    WIN32_FILE_ATTRIBUTE_DATA fa; memset(&fa, 0, sizeof fa); GetFileAttributesExW(p, GetFileExInfoStandard, &fa);
+    BOOL ctSet = !CompareFileTime(&fa.ftCreationTime, &ct);   /* some file systems (Wine on Linux) cannot store it */
+    SetFileAttributesW(p, FILE_ATTRIBUTE_HIDDEN);
+    SetTextForTest(L"new\nあ"); g_enc = 1; g_saveErr[0] = 0;
+    BOOL s1 = SaveFile(p);
+    memset(&fa, 0, sizeof fa); GetFileAttributesExW(p, GetFileExInfoStandard, &fa);
+    BOOL b1 = STFileIs(p, "\xEF\xBB\xBFnew\r\n\xE3\x81\x82", 11);
+    int n1 = STDirCount(d);
+    snprintf(buf, B, "atomic save over a hidden file: ok=%d bytes=%d hidden=%d ctime kept=%d%s files=%d modified=%d",
+             s1, b1, (fa.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0, CompareFileTime(&fa.ftCreationTime, &ct) == 0, ctSet ? "" : " (not stored by this file system)", n1, g_modified);
+    STCheck(s1 && b1 && (fa.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) && (!ctSet || !CompareFileTime(&fa.ftCreationTime, &ct)) && n1 == 1 && !g_modified, buf);
+    /* read-only file: refused with a message, file untouched, still modified */
+    SetFileAttributesW(p, FILE_ATTRIBUTE_READONLY);
+    SetTextForTest(L"other"); g_modified = TRUE; g_saveErr[0] = 0;
+    BOOL s2 = SaveFile(p);
+    BOOL b2 = STFileIs(p, "\xEF\xBB\xBFnew\r\n\xE3\x81\x82", 11);
+    snprintf(buf, B, "read-only file: save refused=%d message=%d untouched=%d still modified=%d files=%d", !s2, g_saveErr[0] != 0, b2, g_modified, STDirCount(d));
+    STCheck(!s2 && g_saveErr[0] && b2 && g_modified && STDirCount(d) == 1, buf);
+    SetFileAttributesW(p, FILE_ATTRIBUTE_NORMAL);
+    /* file held open by another program (no delete sharing): refused, untouched, temporary file removed */
+    HANDLE lk = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    g_saveErr[0] = 0;
+    BOOL s3 = SaveFile(p);
+    if (lk != INVALID_HANDLE_VALUE) CloseHandle(lk);
+    BOOL b3 = STFileIs(p, "\xEF\xBB\xBFnew\r\n\xE3\x81\x82", 11);
+    snprintf(buf, B, "file in use: save refused=%d message=\"%s\" untouched=%d files=%d", !s3, W2U(g_saveErr), b3, STDirCount(d));
+    STCheck(lk != INVALID_HANDLE_VALUE && !s3 && g_saveErr[0] && b3 && g_modified && STDirCount(d) == 1, buf);
+    /* save into a new file in the folder */
+    _snwprintf(q, MAX_PATH, L"%ls\\b.txt", d); g_enc = 2;
+    BOOL s4 = SaveFile(q);
+    snprintf(buf, B, "save as a new file: ok=%d bytes (Shift_JIS doc -> UTF-8, as before)=%d enc=%d", s4, STFileIs(q, "other", 5), g_enc);
+    STCheck(s4 && STFileIs(q, "other", 5) && g_enc == 0 && STDirCount(d) == 2, buf);
+    DeleteFileW(q);
+    /* recovery file: written and read back as the unsaved original */
+    wcscpy(g_path, L"C:\\dir\\元.txt"); g_enc = 2;
+    SetTextForTest(L"復元\n𠮷野家\n\tend"); g_modified = TRUE;
+    BOOL w = RecoveryWriteTo(d, L"st-1.cbrec", q);
+    SetTextForTest(L"x"); g_path[0] = 0; g_enc = 0;
+    BOOL r = RecoveryRestore(q);
+    snprintf(buf, B, "recovery file: write=%d restore=%d text=%d path=\"%s\" enc=%d modified=%d", w, r, DocEquals(L"復元\n𠮷野家\n\tend"), W2U(g_path), g_enc, g_modified);
+    STCheck(w && r && DocEquals(L"復元\n𠮷野家\n\tend") && !wcscmp(g_path, L"C:\\dir\\元.txt") && g_enc == 2 && g_modified, buf);
+    DeleteFileW(q); g_recClaimed[0] = 0;
+    /* shutdown: WM_QUERYENDSESSION writes this session's file; saving removes it */
+    BOOL on0 = g_recOn; WCHAR d0[MAX_PATH * 4]; wcscpy(d0, g_recDir[0]);
+    g_recOn = TRUE; wcscpy(g_recDir[0], d); g_recDir[1][0] = 0;
+    LRESULT qr = SendMessageW(g_frame, WM_QUERYENDSESSION, 0, ENDSESSION_CLOSEAPP);
+    BOOL had = g_recFile[0] && GetFileAttributesW(g_recFile) != INVALID_FILE_ATTRIBUTES && wcsstr(g_recFile, d) == g_recFile;
+    _snwprintf(q, MAX_PATH, L"%ls\\c.txt", d);
+    BOOL s5 = SaveFile(q);
+    snprintf(buf, B, "shutdown: allowed=%d recovery file written=%d, removed after save=%d", (int)qr, had, s5 && !g_recFile[0] && STDirCount(d) == 2);
+    STCheck(qr == TRUE && had && s5 && !g_recFile[0] && STDirCount(d) == 2, buf);
+    g_recOn = on0; wcscpy(g_recDir[0], d0); g_recFile[0] = 0;
+    DeleteFileW(q); DeleteFileW(p); RemoveDirectoryW(d);
+    wcscpy(g_path, keep); g_enc = e0; g_modified = FALSE; g_saveErr[0] = 0;
 }
 static void ST14(char *buf) {
     const size_t B = 512;
@@ -5258,6 +5610,7 @@ static void RunSelfTest(void) {
     }
     /* ================= v1.4 ================= */
     ST14(buf);
+    STSave(buf);
     snprintf(buf, sizeof buf, "RESULT: %s (%d checks, %d failures)\n", g_stfail ? "FAIL" : "PASS", g_stcount, g_stfail);
     STLog("%s", buf);
     if (g_stf) fclose(g_stf);
@@ -5473,11 +5826,12 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdl, int show) {
     InitCommonControlsEx(&icc);
     SetDocText(NULL, 0);
     int argc = 0; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    const WCHAR *file = NULL; BOOL havePos = FALSE; RECT pos = { 0, 0, 0, 0 };
+    const WCHAR *file = NULL, *recover = NULL; BOOL havePos = FALSE; RECT pos = { 0, 0, 0, 0 };
     for (int i = 1; argv && i < argc; i++) {
         if (!wcscmp(argv[i], L"--selftest") && i + 1 < argc) { wcsncpy(g_stlog, argv[++i], MAX_PATH * 4 - 1); g_selftest = 1; }
         else if (!wcscmp(argv[i], L"--demo") && i + 1 < argc) { wcsncpy(g_demo, argv[++i], 31); g_selftest = 1; }
         else if (!wcscmp(argv[i], L"--bench") && i + 2 < argc) { wcsncpy(g_benchFile, argv[++i], MAX_PATH * 4 - 1); wcsncpy(g_stlog, argv[++i], MAX_PATH * 4 - 1); g_bench = 1; g_selftest = 1; }
+        else if (!wcscmp(argv[i], L"--recover") && i + 1 < argc) recover = argv[++i];
         else if (!wcscmp(argv[i], L"--pos") && i + 4 < argc) {
             int x = _wtoi(argv[i + 1]), y = _wtoi(argv[i + 2]), w = _wtoi(argv[i + 3]), h = _wtoi(argv[i + 4]);
             i += 4;
@@ -5485,6 +5839,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdl, int show) {
         } else file = argv[i];
     }
     g_noIni = g_selftest != 0;
+    if (!g_selftest) RecoveryInit();
     if (!g_noIni) LoadIni();
     WNDCLASSEXW wc; memset(&wc, 0, sizeof wc);
     wc.cbSize = sizeof wc; wc.hInstance = hi; wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
@@ -5512,7 +5867,11 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdl, int show) {
         SetWindowPlacement(h, &wp);
     } else ShowWindow(h, show);
     UpdateWindow(h);
-    if (file && !g_selftest) { LoadFile(file); Refresh(FALSE); }
+    if (file && !g_selftest && !recover) { LoadFile(file); Refresh(FALSE); }
+    if (!g_selftest) RecoveryStartup(recover);
+#ifdef CBE_TEST_OOM
+    if (!g_selftest && g_path[0]) { InsertText(L"[oom test]", 10, 0); NoMem(); }   /* test build only */
+#endif
     if (argv) LocalFree(argv);
     MSG msg;
     for (;;) {                              /* input first; layout work only when the queue is empty */
